@@ -21,6 +21,7 @@ import { OWNER_NAME, BOT_NAME, MAIN_AGENT_ID, STORE_DIR, WEB_HOST, WEB_PORT, KAN
 import { listAgentNames, readAgentDisplayName } from '../agent-config.js'
 import { isAgentRunning } from '../agent-process.js'
 import { resolveKanbanDispatchTarget } from '../../kanban-dispatch.js'
+import { shadowRoute } from '../model-routing.js'
 import { generateBreakdown } from '../llm-breakdown.js'
 import { logger } from '../../logger.js'
 import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
@@ -113,6 +114,9 @@ function fireKanbanDispatch(id: string, actor?: string | null): void {
     const content = `[Kanban feladat #${id}]: ${card.title}${desc ? ' — ' + desc : ''}\n\n${kanbanMoveInstructions(id, target)}`
     createAgentMessage(MAIN_AGENT_ID, target, content)
     markKanbanCardDispatched(id)
+    // Jev model-routing shadow (B0): the card itself, not the wrapped
+    // dispatch text, is what a router would classify.
+    shadowRoute({ source: 'kanban', agent: target, text: `${card.title}\n${desc}`, taskRef: id })
     logger.info({ id, target, assignee: card.assignee }, 'Kanban in_progress dispatch fired')
   } catch (err) {
     logger.warn({ err, id }, 'Kanban dispatch failed (card move still succeeded)')

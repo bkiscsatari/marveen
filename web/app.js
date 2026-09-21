@@ -4356,6 +4356,35 @@ document.getElementById('modelSuggestBtn').addEventListener('click', async () =>
   } catch { resultDiv.textContent = t('agents.model.error') }
 })
 
+// Jev model-routing shadow (Phase B0): read-only view of the last suggestions
+// for the open agent. Nothing here changes a model; see docs/model-routing.md.
+document.getElementById('jevRoutingBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const box = document.getElementById('jevRoutingResult')
+  box.style.display = 'block'
+  box.textContent = '...'
+  try {
+    const [stateRes, logRes] = await Promise.all([
+      fetch('/api/model-routing'),
+      fetch('/api/model-routing/log?limit=8&agent=' + encodeURIComponent(currentAgent.name)),
+    ])
+    if (!stateRes.ok || !logRes.ok) throw new Error()
+    const state = await stateRes.json()
+    const rows = await logRes.json()
+    const head = `MODEL_ROUTING=${state.mode}${state.configured ? '' : ' (nincs TYPESAFE_API_KEY)'}`
+    if (!rows.length) {
+      box.textContent = head + '\nMég nincs naplózott javaslat ehhez az ügynökhöz.'
+      return
+    }
+    const lines = rows.map(r => {
+      const when = new Date(r.ts * 1000).toLocaleString('hu-HU')
+      const sug = r.error ? `hiba: ${r.error}` : `${r.suggested_profile ?? 'needs_review'} (${(r.confidence ?? 0).toFixed(2)})`
+      return `${when}  ${r.source.padEnd(11)} -> ${sug}  | futott: ${r.current_model || '?'}\n   ${(r.text_preview || '').slice(0, 90)}`
+    })
+    box.textContent = head + '\n' + lines.join('\n')
+  } catch { box.textContent = 'Nem sikerült lekérni a Jev-javaslatokat.' }
+})
+
 document.getElementById('analyzeAllModelsBtn').addEventListener('click', async () => {
   const panel = document.getElementById('agentsModelAnalysis')
   panel.style.display = 'block'

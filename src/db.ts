@@ -676,6 +676,37 @@ export function initDatabase(dbPathOverride?: string): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_bg_tasks_agent ON background_tasks(agent_id, status)`)
 
+  // Jev model-routing shadow log (Phase B0, 2026-09). One row per dispatched
+  // task: what Jev suggested vs. the model the agent actually ran on. Read
+  // by /api/model-routing and by the offline calibration report in the Jev
+  // repo (joined with token_usage on agent + time window).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_routing_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      task_ref TEXT,
+      task_digest TEXT,
+      text_preview TEXT,
+      suggested_profile TEXT,
+      confidence REAL,
+      complexity REAL,
+      needs_review INTEGER NOT NULL DEFAULT 0,
+      actionable INTEGER NOT NULL DEFAULT 0,
+      flags TEXT,
+      reasons TEXT,
+      current_model TEXT,
+      role TEXT,
+      jev_model TEXT,
+      latency_ms INTEGER,
+      input_tokens INTEGER,
+      cost_usd REAL,
+      error TEXT
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_model_routing_agent_ts ON model_routing_log(agent, ts)`)
+
   // --- Token Usage Monitoring ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS token_usage (
@@ -1605,6 +1636,55 @@ export function createBackgroundTaskAtomic(id: string, agentId: string, prompt: 
     return { id, agent_id: agentId, prompt, status: 'running' as const, tmux_session: tmuxSession, started_at: now, finished_at: null, output: null }
   })()
   return result
+}
+
+export interface ModelRoutingLogRow {
+  source: string
+  agent: string
+  task_ref: string | null
+  task_digest: string | null
+  text_preview: string | null
+  suggested_profile: string | null
+  confidence: number | null
+  complexity: number | null
+  needs_review: number
+  actionable: number
+  flags: string | null
+  reasons: string | null
+  current_model: string | null
+  role: string | null
+  jev_model: string | null
+  latency_ms: number | null
+  input_tokens: number | null
+  cost_usd: number | null
+  error: string | null
+}
+
+export function insertModelRoutingLog(row: ModelRoutingLogRow): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(`INSERT INTO model_routing_log
+    (ts, source, agent, task_ref, task_digest, text_preview, suggested_profile, confidence, complexity,
+     needs_review, actionable, flags, reasons, current_model, role, jev_model, latency_ms, input_tokens, cost_usd, error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(now, row.source, row.agent, row.task_ref, row.task_digest, row.text_preview, row.suggested_profile,
+      row.confidence, row.complexity, row.needs_review, row.actionable, row.flags, row.reasons, row.current_model,
+      row.role, row.jev_model, row.latency_ms, row.input_tokens, row.cost_usd, row.error)
+}
+
+export function listModelRoutingLog(limit = 50, agent?: string): Array<ModelRoutingLogRow & { id: number; ts: number }> {
+  if (agent) {
+    return db.prepare('SELECT * FROM model_routing_log WHERE agent = ? ORDER BY ts DESC, id DESC LIMIT ?')
+      .all(agent, limit) as Array<ModelRoutingLogRow & { id: number; ts: number }>
+  }
+  return db.prepare('SELECT * FROM model_routing_log ORDER BY ts DESC, id DESC LIMIT ?')
+    .all(limit) as Array<ModelRoutingLogRow & { id: number; ts: number }>
+}
+
+export function modelRoutingSummary(): Array<{ agent: string; suggested_profile: string | null; n: number; avg_confidence: number | null; errors: number }> {
+  return db.prepare(`SELECT agent, suggested_profile, COUNT(*) AS n, AVG(confidence) AS avg_confidence,
+      SUM(CASE WHEN error IS NULL THEN 0 ELSE 1 END) AS errors
+    FROM model_routing_log GROUP BY agent, suggested_profile ORDER BY agent, n DESC`)
+    .all() as Array<{ agent: string; suggested_profile: string | null; n: number; avg_confidence: number | null; errors: number }>
 }
 
 export function getRunningBackgroundTasks(): BackgroundTask[] {

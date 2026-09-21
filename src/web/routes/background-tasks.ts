@@ -9,6 +9,7 @@ import { resolveFromPath } from '../../platform.js'
 import { APP_TZ } from '../../config.js'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
+import { shadowRoute } from '../model-routing.js'
 import type { RouteContext } from './types.js'
 
 const TMUX = resolveFromPath('tmux')
@@ -74,6 +75,10 @@ export function spawnBackgroundTask(agentId: string, prompt: string): Background
   }
 
   logger.info({ id, agentId, session, prompt: prompt.slice(0, 100) }, 'Background task started')
+  // Jev model-routing shadow (B0). A background task is a fresh `claude -p`
+  // process, so this is the first place a suggestion could later become a
+  // per-task --model flag (B1) without respawning anything.
+  shadowRoute({ source: 'background', agent: agentId, text: prompt, taskRef: id })
 
   setTimeout(() => checkAndFinalize(id), TIMEOUT_MS)
   pollUntilDone(id)
