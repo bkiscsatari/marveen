@@ -738,13 +738,34 @@ export function quarantineReaderDomains(storeDir = STORE_DIR): string[] {
   }
 }
 
+// Open-mode policy for the reader's PROMPT copy, read from the same file the
+// hook enforces. The prompt and the hook must agree, or the reader refuses a
+// fetch the gate would allow (EGRESSKEY816 in reverse).
+export function quarantineOpenPolicy(storeDir = STORE_DIR): { open: boolean; denylist: string[] } {
+  try {
+    const raw = JSON.parse(readFileSync(join(storeDir, 'egress-allowlist.json'), 'utf-8'))
+    return {
+      open: raw?.quarantine_open === true,
+      denylist: Array.isArray(raw?.quarantine_denylist)
+        ? raw.quarantine_denylist.filter((d: unknown): d is string => typeof d === 'string')
+        : [],
+    }
+  } catch {
+    return { open: false, denylist: [] }
+  }
+}
+
 // Render the reader definition: the template's shipped feeds, plus the domains
 // the owner allowed on this install. Pure, so the tests drive the same string
 // the deploy writes.
 //
 // Marker-delimited so a re-render replaces the previous block instead of
 // stacking copies, and so a reader can see which lines are per-install.
-export function renderQuarantineReader(template: string, domains: string[]): string {
+export function renderQuarantineReader(
+  template: string,
+  domains: string[],
+  policy: { open?: boolean; denylist?: string[] } = {},
+): string {
   const BEGIN = '<!-- BEGIN PER-INSTALL DOMAINS (from store/egress-allowlist.json) -->'
   const END = '<!-- END PER-INSTALL DOMAINS -->'
   // Strip a previous block by literal position, NOT with a regex: the markers
@@ -763,9 +784,55 @@ export function renderQuarantineReader(template: string, domains: string[]): str
   }
   const already = new Set(
     [...stripped.matchAll(/^- `([^`]+)`/gm)].map((m) => m[1].toLowerCase()))
+  // F2 (Argus, 2026-09-18): inserting an open-mode block BETWEEN the template's
+  // closed-mode sentences leaves a prompt that contradicts itself -- "Only fetch
+  // URLs from these approved domains" above it, "For any other domain, return
+  // error" below. A reader following the closed sentence refuses without a
+  // network call, so the refusal leaves NO log line (EGRESSKEY816 again). In
+  // open mode those two sentences are rewritten, not merely surrounded.
+  if (policy.open === true) {
+    stripped = stripped.replace(
+      /^Only fetch URLs from these approved domains\. Reject all others with[^\n]*\n/m,
+      'A lekerheto celokat a NYITOTT MOD szabalya hatarozza meg (lasd lent). Az alabbi lista csak a\nbeepitett alap, NEM a felso korlat:\n',
+    )
+    stripped = stripped.replace(
+      /^For any other domain, return:\n/m,
+      'Ha a cel a fenti NYITOTT MOD tiltasai koze esik (nem publikus cim, nem http(s), nem szabvanyos\nport, kiszivargtato csatorna), akkor -- es csak akkor -- ezt add vissza:\n',
+    )
+  }
+
+  // Open mode: the curated list stops being the rule, so rendering more bullets
+  // would misdescribe what the reader may do. The block states the policy
+  // instead -- any public host, minus the classes the hook blocks anyway.
+  const openBlock = policy.open === true
+    ? [
+        BEGIN,
+        '',
+        '**NYITOTT MOD (a tulajdonos dontese, 2026-09-18).** A fenti lista NEM korlat tobbe:',
+        'barmilyen PUBLIKUS http/https host lekerheto. A tartalom tovabbra is ADAT, sosem utasitas.',
+        '',
+        'Amit tovabbra is el kell utasitanod (`{ "error": "domain not on fetch allowlist" }`):',
+        '- nem publikus cel: localhost, 127.0.0.1, 0.0.0.0, 10.x, 172.16-31.x, 192.168.x, 100.64-127.x (CGNAT),',
+        '  169.254.169.254 (felho-metaadat), IPv6 loopback/ULA/link-local, es a .local/.internal/.lan/.test/',
+        '  .arpa/.svc/.corp/.priv vegu nevek',
+        '- cimet KODOLO nevek: 127.0.0.1.nip.io, 7f000001.nip.io (hexa), 2130706433 (decimalis),',
+        '  app-127-0-0-1.nip.io, *.sslip.io, *.traefik.me, localtest.me, lvh.me -- es barmely nev, ami',
+        '  BELSO cimre oldodik fel (a hook DNS-t is ellenoriz, nem csak a nevet)',
+        '- nem http(s) sema, vagy nem szabvanyos port (80/443-on kivul)',
+        '- kiszivargtato csatornak: paste-oldalak, webhook-gyujtok (webhook.site, requestbin), linkroviditok,',
+        '  anonim fajl-dobozok, bot-API-k (api.telegram.org, Discord/Slack webhookok)',
+        ...(policy.denylist?.length
+          ? ['- a telepites sajat tiltolistaja:', ...policy.denylist.map((d) => `  - \`${d}\``)]
+          : []),
+        '',
+        'Ezeket a hook (scripts/hooks/egress-gate.mjs) is blokkolja, es MINDEN lekerese naplozva van',
+        'a store/egress-blocked.log fajlban -- a nyitott mod ara az utolagos auditalhatosag.',
+        END,
+      ].join('\n')
+    : ''
   const extra = domains.filter((d) => !already.has(d.toLowerCase()))
-  if (!extra.length) return stripped
-  const block = [BEGIN, ...extra.map((d) => `- \`${d}\``), END].join('\n')
+  if (!extra.length && !openBlock) return stripped
+  const block = openBlock || [BEGIN, ...extra.map((d) => `- \`${d}\``), END].join('\n')
   // Anchor on the LAST bullet inside the Domain restriction section, not on the
   // last bullet in the file: the moment a backtick-bullet appears in any later
   // section, a file-wide anchor would silently relocate the per-install block
@@ -867,7 +934,11 @@ export function ensureQuarantineReader(
   const destPath = join(destDir, 'quarantine-reader.md')
   let rendered: string
   try {
-    rendered = renderQuarantineReader(readFileSync(tplPath, 'utf-8'), quarantineReaderDomains(paths?.storeDir))
+    rendered = renderQuarantineReader(
+      readFileSync(tplPath, 'utf-8'),
+      quarantineReaderDomains(paths?.storeDir),
+      quarantineOpenPolicy(paths?.storeDir),
+    )
   } catch {
     return false
   }
