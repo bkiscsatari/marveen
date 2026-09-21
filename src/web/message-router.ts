@@ -116,18 +116,63 @@ function notifyOrchestratorOfStuckSession(agent: string, session: string, stuckM
   }
 }
 
+export interface HandoffFailureNotice {
+  to: string
+  text: string
+}
+
+/**
+ * Pure decision: who is told that a message was finally abandoned, and what
+ * each of them is told.
+ *
+ * Card 98eeb2b5 (measured 2026-09-20): the notice went to the ORCHESTRATOR
+ * only. Two brix messages (ids 1803/1804) died for good and brix was never
+ * told -- both notices (1849/1850) landed in icuka's inbox. From the sender's
+ * own side nothing contradicts "I sent it, so it arrived": the send receipt
+ * (`OK id=<n>`) measures ACCEPTANCE into the queue, not delivery, and the one
+ * signal that would have corrected that was addressed to somebody else.
+ *
+ * So the sender gets a copy too. The orchestrator copy stays: the PM needs the
+ * fleet-level view, and it is the only copy when the sender is a system notice
+ * or the orchestrator itself.
+ */
+export function formatHandoffFailureNotices(
+  msg: Pick<AgentMessage, 'id' | 'from_agent' | 'to_agent' | 'content'>,
+  mainAgentId: string,
+  reason: string,
+): HandoffFailureNotice[] {
+  // A failed message to the main agent can't happen (pull model), but guard
+  // anyway so we never loop a notification back onto itself.
+  if (msg.to_agent === mainAgentId) return []
+  const preview = (msg.content ?? '').slice(0, 220)
+  const notices: HandoffFailureNotice[] = [{
+    to: mainAgentId,
+    text: `[handoff-failure] Inter-agent message (id ${msg.id}) ${msg.from_agent} -> ${msg.to_agent} could NOT be delivered: ${reason}. Consider re-sending or checking the target agent. Content preview: ${preview}`,
+  }]
+  const sender = msg.from_agent
+  // 'system' is not an inbox anyone drains, and a qualified (federated) name
+  // would send this notice across the bridge -- bridge.ts refuses a slash-free
+  // 'system' sender, so such a copy could only bounce. The orchestrator copy
+  // above already covers both cases.
+  const senderIsReachable = sender.length > 0 && sender !== 'system' && !sender.includes('/')
+  if (senderIsReachable && sender !== mainAgentId) {
+    notices.push({
+      to: sender,
+      text: `[handoff-failure] YOUR message (id ${msg.id}) to ${msg.to_agent} was NOT delivered: ${reason}. It is final, the queue has stopped retrying it. The send receipt you saw measured acceptance into the queue, not delivery. Do not assume the recipient read it: re-send only after checking that the target agent is running, otherwise raise it with the orchestrator. Content preview: ${preview}`,
+    })
+  }
+  return notices
+}
+
 function notifyOrchestratorOfFailedHandoff(msg: AgentMessage, reason: string): void {
   try {
-    // A failed message to the main agent can't happen (pull model), but guard
-    // anyway so we never loop a notification back onto itself.
-    if (msg.to_agent === MAIN_AGENT_ID) return
-    const preview = (msg.content ?? '').slice(0, 220)
-    createAgentMessage(
-      'system',
-      MAIN_AGENT_ID,
-      `[handoff-failure] Inter-agent message (id ${msg.id}) ${msg.from_agent} -> ${msg.to_agent} could NOT be delivered: ${reason}. Consider re-sending or checking the target agent. Content preview: ${preview}`,
+    const notices = formatHandoffFailureNotices(msg, MAIN_AGENT_ID, reason)
+    if (notices.length === 0) return
+    for (const notice of notices) createAgentMessage('system', notice.to, notice.text)
+    logger.info(
+      { id: msg.id, from: msg.from_agent, to: msg.to_agent, reason, notified: notices.map((n) => n.to) },
+      'handoff-failure surfaced to orchestrator and sender',
     )
-    logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, reason }, 'handoff-failure surfaced to orchestrator')
   } catch (err) {
     logger.warn({ err, id: msg.id }, 'Failed to enqueue handoff-failure notification')
   }
