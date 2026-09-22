@@ -38,9 +38,9 @@ describe('runtime registry', () => {
   })
 
   it('an unshipped adapter fails loudly, naming the phase', async () => {
-    await expect(getRuntime('codex-cli')).rejects.toBeInstanceOf(RuntimeNotAvailableError)
-    await expect(getRuntime('codex-cli')).rejects.toThrow(/Phase 2/)
+    await expect(getRuntime('gemini-cli')).rejects.toBeInstanceOf(RuntimeNotAvailableError)
     await expect(getRuntime('gemini-cli')).rejects.toThrow(/Phase 3/)
+    await expect(getRuntime('native-api')).rejects.toThrow(/Phase 4/)
   })
 
   it('claude-tmux loads lazily on first request and is cached', async () => {
@@ -52,9 +52,9 @@ describe('runtime registry', () => {
   })
 
   it('availableRuntimeKinds = registered + loadable built-ins (Phase 0: tmux, Phase 1: headless)', () => {
-    expect(availableRuntimeKinds()).toEqual(['claude-tmux', 'claude-headless'])
+    expect(availableRuntimeKinds()).toEqual(['claude-tmux', 'claude-headless', 'codex-cli'])
     registerRuntime(fakeRuntime('native-api'))
-    expect(availableRuntimeKinds()).toEqual(['claude-tmux', 'claude-headless', 'native-api'])
+    expect(availableRuntimeKinds()).toEqual(['claude-tmux', 'claude-headless', 'codex-cli', 'native-api'])
   })
 
   it('claude-headless loads lazily too', async () => {
