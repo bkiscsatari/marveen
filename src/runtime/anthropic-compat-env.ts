@@ -69,6 +69,40 @@ function firstSecret(ids: readonly string[], lookup: (id: string) => string | nu
   return ''
 }
 
+/**
+ * Structured form: the environment variables (no shell quoting) a Claude CLI
+ * child process needs to talk to the model's vendor. Empty for Anthropic
+ * itself and for vendors without a compatible endpoint. Used by the
+ * claude-headless adapter (spawn env); the tmux launcher uses the string form.
+ */
+export function resolveProviderEnvVars(
+  model: string,
+  secretLookup: (id: string) => string | null,
+): Record<string, string> {
+  const provider = inferProvider(model)
+  switch (provider) {
+    case 'anthropic':
+    case 'openai':
+    case 'google':
+      return {}
+    case 'ollama':
+      return { ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_BASE_URL: OLLAMA_URL, ANTHROPIC_MODEL: model }
+    case 'minimax':
+      return {
+        ANTHROPIC_AUTH_TOKEN: firstSecret(providerSecretIds('minimax'), secretLookup),
+        ANTHROPIC_BASE_URL: ENDPOINTS.minimax!,
+        ANTHROPIC_MODEL: model,
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
+      }
+    default:
+      return {
+        ANTHROPIC_AUTH_TOKEN: firstSecret(providerSecretIds(provider), secretLookup),
+        ANTHROPIC_BASE_URL: ENDPOINTS[provider]!,
+        ANTHROPIC_MODEL: model,
+      }
+  }
+}
+
 export function resolveProviderEnv(
   model: string,
   secretLookup: (id: string) => string | null,

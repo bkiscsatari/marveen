@@ -1,4 +1,5 @@
 import http from 'node:http'
+import { workerRuntimeKind } from './runtime/flags.js'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -342,7 +343,7 @@ export function startWebServer(port = 3420): http.Server {
   // heartbeat / scheduled generation after boot does not pay the cold-boot
   // latency. runViaWorker still lazy-starts + restarts it on demand, so this is
   // a warm-up, not a hard dependency. Skipped on the SDK rollback backend.
-  if (!webOnly && (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk') {
+  if (!webOnly && (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk' && workerRuntimeKind() !== 'claude-headless') {
     import('./web/agent-worker.js')
       .then(m => { m.startWorkerSession(); logger.info('Interactive agent worker pre-started') })
       .catch(err => logger.warn({ err }, 'Failed to pre-start agent worker (will lazy-start on first use)'))

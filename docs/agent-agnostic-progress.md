@@ -35,3 +35,24 @@ Döntések/feltételezések:
 - `usageSince` a `claude-tmux` adapterben egyelőre üres listát ad: a transcript-bányászat továbbra is a flotta-szintű `collectTokenUsage` sweep; per-handle olvasás a 7. szakasz usage-refaktorjával jön.
 
 Nyitott owner-teendők (eddig): —
+
+## Phase 1 — `claude-headless` adapter + egylövetű fogyasztók az interfészen
+
+Élő próbák (2026-09-22, Claude Code 2.1.278, `claude -p --output-format stream-json --verbose`): sima szöveg, tool-használat (Read), `--resume` folytatás azonos session-id-vel, kétkörös `--input-format stream-json`, és a `rate_limit_event` (5h/7d kihasználtság). A rögzített kimenetek: `src/__tests__/fixtures/claude-headless/*.jsonl` (köztük az „auth failed” eset is).
+
+Fontos tanulság: a host `~/.claude` **nincs bejelentkezve** ebben a shell-kontextusban; a flotta a `CLAUDE_CODE_OAUTH_TOKEN`-t az éles `.env`-ből kapja. A dev `.env`-be átmásoltam ugyanazt a sort. A headless futás **izolált** `CLAUDE_CONFIG_DIR`-t használ (`~/.<MAIN_AGENT_ID>-headless/.claude-config`, a worker `ensureWorkerCwd`-jével építve: csatorna-pluginok kikapcsolva, `--strict-mcp-config`), mert a host-konfigból indított `-p` futás **betöltötte a Telegram plugint** (409-veszély az éles bottal).
+
+Új modulok:
+- `src/runtime/stream-json.ts` — parser + akkumulátor + `summaryToRunResult` (a `classifyAgentResult` újrahasznosításával), `usageFromResult`, `streamShowsAuthFailure`.
+- `src/runtime/claude-headless.ts` — az adapter: `run()` child_process + stdin-prompt + JSONL; `spawn/send/state/stop` headless „session” = resume-lánc; `healthProbe` = valós haiku-hívás; `buildHeadlessArgs`/`buildHeadlessEnv`/`resolveFleetOauthToken` tiszta, tesztelt.
+- `src/runtime/flags.ts` — `MARVEEN_WORKER_RUNTIME` (`claude-tmux` default | `claude-headless`), `MARVEEN_BG_RUNTIME` (`legacy-tmux` default | bármely runtime).
+- `src/runtime/usage-sink.ts` — `token_usage` insert `runtime/provider/cost_usd` oszlopokkal (db.ts migráció).
+- `src/runtime/agent-spec.ts` — `buildAgentSpec(agentId, role)`.
+- `anthropic-compat-env.ts` — `resolveProviderEnvVars` (strukturált változat a spawn-env-hez).
+
+Módosított: `src/agent.ts` (headless ág a flag mögött, a `runAgent` szerződése változatlan), `src/web/routes/background-tasks.ts` (runtime-alapú futtatás `rt:<kind>:<id>` jelölővel, élő kimenet `onProgress`-ből), `src/web.ts` (nincs tmux-worker előindítás headless módban), `src/db.ts`, `src/runtime/registry.ts`, `types.ts` (`onProgress`).
+
+Döntések:
+- A háttérfeladat runtime-módban az **agent saját könyvtárában** fut (a régi út a dashboard cwd-jében futott, agenttől függetlenül).
+- `killSession` runtime-módban no-op: a futást a saját timeoutja határolja; explicit megszakítás a Phase 5 handle-kezelésével jön.
+- A `MARVEEN_WORKER_RUNTIME=claude-headless` mód nem indít tmux-workert; a `runViaWorker` auth-önjavító ciklusa helyett a headless `blocked+reason` jelzi az auth-hibát (a hívók `if (!text) throw` őre változatlanul működik).

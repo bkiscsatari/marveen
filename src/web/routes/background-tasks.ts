@@ -11,6 +11,32 @@ import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
 import { shadowRoute } from '../model-routing.js'
 import type { RouteContext } from './types.js'
+import { bgRuntimeKind } from '../../runtime/flags.js'
+import { getRuntime } from '../../runtime/registry.js'
+import { buildAgentSpec } from '../../runtime/agent-spec.js'
+import type { RuntimeKind } from '../../runtime/types.js'
+
+export { bgRuntimeKind }
+
+// Phase 1 (agent-agnostic): MARVEEN_BG_RUNTIME=<runtime> executes background
+// tasks through a runtime adapter instead of `claude -p` in a tmux session.
+// The task row's tmux_session column then carries a `rt:<kind>:<id>` marker
+// (never a real tmux name), and live output comes from the adapter's
+// onProgress stream instead of capture-pane. Default: the legacy path.
+export function runtimeSessionRef(kind: RuntimeKind, id: string): string {
+  return `rt:${kind}:${id}`
+}
+
+export function isRuntimeBackedSession(session: string | null | undefined): boolean {
+  return typeof session === 'string' && session.startsWith('rt:')
+}
+
+function runtimeTaskId(session: string): string {
+  return session.split(':')[2] ?? ''
+}
+
+// id -> live output buffer for runtime-backed tasks still running in THIS process.
+const runtimeLive = new Map<string, { output: string }>()
 
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude')
@@ -24,6 +50,7 @@ function bgSessionName(id: string): string {
 }
 
 function isBgSessionAlive(session: string): boolean {
+  if (isRuntimeBackedSession(session)) return runtimeLive.has(runtimeTaskId(session))
   try {
     const out = execFileSync(TMUX, ['list-sessions', '-F', '#{session_name}'], { timeout: 3000, encoding: 'utf-8' })
     return out.split('\n').some(l => l.trim() === session)
@@ -33,6 +60,7 @@ function isBgSessionAlive(session: string): boolean {
 }
 
 function captureSession(session: string): string | null {
+  if (isRuntimeBackedSession(session)) return runtimeLive.get(runtimeTaskId(session))?.output ?? null
   try {
     return execFileSync(TMUX, ['capture-pane', '-t', session, '-p', '-S', '-500'], { timeout: 5000, encoding: 'utf-8' })
   } catch {
@@ -41,13 +69,50 @@ function captureSession(session: string): string | null {
 }
 
 function killSession(session: string): void {
+  // A runtime-backed run is bounded by its own timeout; nothing to kill here.
+  if (isRuntimeBackedSession(session)) return
   try {
     execFileSync(TMUX, ['kill-session', '-t', session], { timeout: 3000 })
   } catch { /* already dead */ }
 }
 
+function spawnViaRuntime(id: string, agentId: string, prompt: string, kind: RuntimeKind): BackgroundTask | { error: string } {
+  const ref = runtimeSessionRef(kind, id)
+  const task = createBackgroundTaskAtomic(id, agentId, prompt, ref, MAX_CONCURRENT)
+  if (!task) {
+    return { error: `Maximum ${MAX_CONCURRENT} egyidejű háttérfeladat ágensenként.` }
+  }
+  const live = { output: '' }
+  runtimeLive.set(id, live)
+  void (async () => {
+    try {
+      const rt = await getRuntime(kind)
+      const spec = buildAgentSpec(agentId, 'background')
+      const r = await rt.run(spec, prompt, {
+        allowTools: true,
+        timeoutMs: TIMEOUT_MS,
+        timeoutAsError: true,
+        onProgress: (chunk) => { live.output = (live.output + chunk).slice(-20_000) },
+      })
+      const status = r.blocked ? (/timeout/i.test(r.reason ?? '') ? 'timeout' : 'failed') : 'done'
+      finishBackgroundTask(id, status, r.text ?? (r.reason ? `(${r.reason})` : '(no output)'))
+      logger.info({ id, agentId, kind, status, costUsd: r.usage?.costUsd }, 'Background task finished via runtime')
+    } catch (err) {
+      finishBackgroundTask(id, 'failed', `(runtime error: ${(err as Error).message})`)
+      logger.error({ err, id, agentId, kind }, 'Background task runtime failure')
+    } finally {
+      runtimeLive.delete(id)
+    }
+  })()
+  logger.info({ id, agentId, kind, prompt: prompt.slice(0, 100) }, 'Background task started via runtime')
+  shadowRoute({ source: 'background', agent: agentId, text: prompt, taskRef: id })
+  return task
+}
+
 export function spawnBackgroundTask(agentId: string, prompt: string): BackgroundTask | { error: string } {
   const id = randomBytes(4).toString('hex').toUpperCase()
+  const kind = bgRuntimeKind()
+  if (kind !== 'legacy-tmux') return spawnViaRuntime(id, agentId, prompt, kind)
   const session = bgSessionName(id)
 
   const task = createBackgroundTaskAtomic(id, agentId, prompt, session, MAX_CONCURRENT)

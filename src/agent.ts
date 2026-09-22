@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import { PROJECT_ROOT } from './config.js'
+import { workerRuntimeKind } from './runtime/flags.js'
 
 const TYPING_REFRESH_MS = 4000
 import { logger } from './logger.js'
@@ -142,6 +143,27 @@ export async function runAgent(
   opts: RunAgentOpts = {},
 ): Promise<{ text: string | null; newSessionId?: string; error?: string }> {
   const timeoutMs = opts.timeoutMs ?? AGENT_TIMEOUT_MS
+  // Phase 1 (agent-agnostic): MARVEEN_WORKER_RUNTIME=claude-headless serves
+  // one-shots through the headless runtime adapter (a `claude -p` child
+  // process with stream-json output) instead of the interactive tmux worker.
+  // Same contract: text=null + error on a blocked/errored/timed-out result.
+  // A non-default cwd (heartbeat's isolated dir) is honoured; PROJECT_ROOT
+  // means "neutral", exactly as the tmux worker treats every cwd.
+  if (workerRuntimeKind() === 'claude-headless') {
+    const { getRuntime } = await import('./runtime/registry.js')
+    const { headlessWorkerSpec } = await import('./runtime/claude-headless.js')
+    const rt = await getRuntime('claude-headless')
+    const typingInterval = onTyping ? setInterval(onTyping, TYPING_REFRESH_MS) : undefined
+    try {
+      const r = await rt.run(headlessWorkerSpec(), message, {
+        resume: sessionId, timeoutMs, timeoutAsError: opts.timeoutAsError, allowTools,
+        cwd: cwd !== PROJECT_ROOT ? cwd : undefined, env,
+      })
+      return { text: r.text, newSessionId: r.sessionRef, error: r.blocked ? r.reason : undefined }
+    } finally {
+      if (typingInterval) clearInterval(typingInterval)
+    }
+  }
   if (agentBackend() === 'worker') {
     // The interactive worker is a single shared session with its own fixed,
     // isolated, NEUTRAL cwd/config -- so the SDK-era per-call cwd/env isolation

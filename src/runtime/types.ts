@@ -156,6 +156,8 @@ export interface RunOptions {
   allowTools?: boolean
   cwd?: string
   env?: Record<string, string | undefined>
+  /** Streaming text chunks as the model produces them (live output views). */
+  onProgress?: (chunk: string) => void
 }
 
 export interface HealthProbeResult {

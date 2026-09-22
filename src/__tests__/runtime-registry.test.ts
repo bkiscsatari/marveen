@@ -51,10 +51,15 @@ describe('runtime registry', () => {
     expect(await getRuntime('claude-tmux')).toBe(rt)
   })
 
-  it('availableRuntimeKinds = registered + loadable built-ins', () => {
-    expect(availableRuntimeKinds()).toEqual(['claude-tmux'])
+  it('availableRuntimeKinds = registered + loadable built-ins (Phase 0: tmux, Phase 1: headless)', () => {
+    expect(availableRuntimeKinds()).toEqual(['claude-tmux', 'claude-headless'])
     registerRuntime(fakeRuntime('native-api'))
-    expect(availableRuntimeKinds()).toEqual(['claude-tmux', 'native-api'])
+    expect(availableRuntimeKinds()).toEqual(['claude-tmux', 'claude-headless', 'native-api'])
+  })
+
+  it('claude-headless loads lazily too', async () => {
+    const rt = await getRuntime('claude-headless')
+    expect(rt.kind).toBe('claude-headless')
   })
 
   it('defaultRuntimeKind honours a VALID env override only', () => {

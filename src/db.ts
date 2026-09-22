@@ -732,6 +732,13 @@ export function initDatabase(dbPathOverride?: string): void {
   // Migrations for columns added after initial release
   try { db.exec('ALTER TABLE token_usage ADD COLUMN thinking_tokens INTEGER NOT NULL DEFAULT 0') } catch { /* already exists */ }
   try { db.exec('ALTER TABLE token_usage ADD COLUMN model TEXT') } catch { /* already exists */ }
+  // Agent-agnostic Phase 1: which runtime/vendor produced the row, and the
+  // vendor-reported cost when a runtime emits it as an event (claude-headless
+  // total_cost_usd, Codex/Gemini usage events). Transcript-mined rows leave
+  // them NULL, which the cost views read as "Claude via tmux".
+  try { db.exec('ALTER TABLE token_usage ADD COLUMN runtime TEXT') } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE token_usage ADD COLUMN provider TEXT') } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE token_usage ADD COLUMN cost_usd REAL') } catch { /* already exists */ }
 
   // Deduplicate existing rows before creating unique index
   try {

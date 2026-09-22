@@ -32,6 +32,7 @@ type Loader = () => Promise<{ default: AgentRuntime } | { runtime: AgentRuntime 
 
 const BUILTIN_LOADERS: Partial<Record<RuntimeKind, Loader>> = {
   'claude-tmux': () => import('./claude-tmux.js'),
+  'claude-headless': () => import('./claude-headless.js'),
 }
 
 export function registerRuntime(rt: AgentRuntime): void {
