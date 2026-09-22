@@ -1,21 +1,28 @@
+import { tmuxStderr } from './tmux-stderr.js'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { logger } from '../logger.js'
 import { makeLazyBinResolver } from '../platform.js'
 import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
-import { listAgentNames, readAgentClaudeConfigDir } from './agent-config.js'
-import { agentSessionName, capturePane, sendPromptToSession } from './agent-process.js'
+import { listAgentNames } from './agent-config.js'
+import { resolveAgentConfigDirForRead } from './claude-plans.js'
+import { agentSessionName, capturePane } from './agent-process.js'
+import { sendSystemDirective } from './system-directive.js'
 import { detectPaneState } from '../pane-state.js'
 import { detectsUsageLimit } from '../model-fallback.js'
 import { readContextTokensFromProjectDir, projectsDirFor } from './active-model.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
+// One copy, in a module neither runner owns (the gate imports the guard, so the
+// guard cannot import the gate back). Re-exported below because #1382's test
+// -- and any future reader -- looks for these names here.
+import { configDirFor, newestMainConfigRoot } from './main-transcript-root.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { getHardGuardPhase } from './context-guard-runner.js'
 import { readGateConfig, readGateRunState, writeGateRunState } from './context-restart-gate-store.js'
 import {
   getDispatchedPendingStats,
-  hasOpenInboundQuestion,
+  openInboundQuestionMessageId,
   createAgentMessage,
 } from '../db.js'
 import {
@@ -33,8 +40,9 @@ import {
 // This complements the hard context-guard (context-guard-runner.ts), which
 // acts at 90%/97% of the context window via hard process restarts. The soft
 // gate acts much earlier (default 400k tokens) via /clear -- the SessionStart
-// hooks (ledger-replay, taskstate-replay, daily-log-digest) then inject a rich
-// context snapshot into the fresh session automatically.
+// hooks (clear-replay, taskstate-replay, and ledger-replay for the agents whose
+// channel turns are logged) then inject a context snapshot into the fresh
+// session automatically.
 //
 // The runner starts 3 minutes after dashboard boot (offset from context-guard's
 // 4.5 min so the two sweeps do not fire simultaneously) and then sweeps on each
@@ -53,8 +61,8 @@ const INITIAL_DELAY_MS = 3 * 60_000   // 3 min
 export function gateWakePrompt(): string {
   return (
     '[CONTEXT-RESTART-GATE] Friss kontextussal indultal, mert a kapu ujrainditott (/clear). ' +
-    'A visszatoltott blokkokban ott a beszelgetes vege, a napi naplo kivonata es -- ha volt futo munkad -- ' +
-    'a TASK-FOLYTATAS a mar kesz lepesekkel es a kovetkezo akcioval. ' +
+    'A visszatoltott blokkokban ott a torolt szal vege (utolso keresek, utolso valaszod, az atirat utja) ' +
+    'es -- ha volt futo munkad -- a TASK-FOLYTATAS a mar kesz lepesekkel es a kovetkezo akcioval. ' +
     'Olvasd be oket, ellenorizd a kanban tabladat es a hot memoriaidat, es FOLYTASD onnan ahol abbamaradt. ' +
     'Ne kezdd elolrol ami mar kesz, es ne delegald ujra amit mar atadtal. ' +
     'Ha nem volt futo munkad, az is teljes erteku allapot -- olyankor ne talalj ki magadnak feladatot. ' +
@@ -115,6 +123,42 @@ export function isInfrastructureChild(childAgeS: number, claudeAgeS: number): bo
   return false
 }
 
+/**
+ * The last inbound message the ledger drain surfaced for this agent, or null.
+ * The drain (scripts/hooks/ledger-live-drain.py) writes the id into
+ * store/.ledger-drain-<agent> when it puts a lost inbound in front of the
+ * agent; the sanitisation here mirrors its _statefile().
+ */
+function drainSurfacedMessageId(ledgerAgentId: string): string | null {
+  const safe = String(ledgerAgentId).replace(/[^A-Za-z0-9_-]/g, '_')
+  try {
+    const raw = readFileSync(join(PROJECT_ROOT, 'store', `.ledger-drain-${safe}`), 'utf-8').trim()
+    return raw || null
+  } catch { return null }
+}
+
+/**
+ * Does an unanswered inbound still justify holding the gate shut?
+ *
+ * Only until the agent has actually been SHOWN it. Before that, a /clear could
+ * lose a question nobody has read; after it, the agent knows and the decision
+ * to answer is its own -- and some messages rightly get no answer. Laszlo's
+ * "ok" on 2026-09-04 22:24 held the gate for eight hours at 630% of the
+ * threshold, and the only way out would have been to wake him at midnight with
+ * a reply nobody needed (LEDGERACK905, his call: block until surfaced, no
+ * arbitrary timer).
+ *
+ * Pure so the rule is testable without a database or a statefile.
+ */
+export function openQuestionBlocks(
+  openMessageId: string | null,
+  surfacedMessageId: string | null,
+): boolean {
+  if (openMessageId === null) return false      // nothing open
+  if (openMessageId === '') return true         // open, but unidentifiable: hold
+  return openMessageId !== surfacedMessageId    // held until the drain showed it
+}
+
 function sessionFor(name: string): string {
   return name === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(name)
 }
@@ -124,18 +168,7 @@ function workingDirFor(name: string): string {
   return join(PROJECT_ROOT, 'agents', name)
 }
 
-/**
- * Claude Code config root for an agent, or undefined for the host default.
- *
- * Transcripts live under <config-root>/projects/<encoded-working-dir>/, and an
- * agent launched with CLAUDE_CONFIG_DIR keeps them somewhere other than
- * ~/.claude. Reading without this looks in the default root, finds nothing, and
- * the gate's contextTokens comes back null -- which is a fail-closed BLOCK, so
- * the symptom is a gate that never opens and never says why.
- */
-function configDirFor(name: string): string | undefined {
-  return name === MAIN_AGENT_ID ? undefined : (readAgentClaudeConfigDir(name) ?? undefined)
-}
+export { configDirFor, newestMainConfigRoot }
 
 function agentIdForLedger(name: string): string {
   // The main agent's ledger key is the MAIN_AGENT_ID (e.g. "bigme"), same as
@@ -175,13 +208,21 @@ function capturePaneOrNull(session: string): string | null {
 //
 // On ps failure for any PID: fail-closed (return null → decideGate blocks).
 
+// TMUXWINDOWATTR920: stderr is PIPED, not inherited. Without a stdio option
+// execFileSync copies the child's stderr onto the parent's stderr as well, so
+// tmux's "can't find window/session: ..." landed in dashboard.error.log
+// undated and unattributed (133 + ~3000 such lines measured 2026-09-20). The
+// message now goes through the logger with the call site and the session.
 function getPanePid(session: string): number | null {
   try {
     const raw = execFileSync(tmuxBin(), ['list-panes', '-t', session, '-F', '#{pane_pid}'],
-      { timeout: 3000, encoding: 'utf-8' })
+      { timeout: 3000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
     const pid = parseInt(raw.split('\n')[0]?.trim() ?? '', 10)
     return Number.isFinite(pid) && pid > 0 ? pid : null
-  } catch { return null }
+  } catch (err) {
+    logger.warn({ site: 'context-restart-gate-runner.getPanePid', session, tmux: tmuxStderr(err) }, 'tmux list-panes failed')
+    return null
+  }
 }
 
 // PORTABILITY: `ps --ppid` is GNU/procps-only. BSD ps (macOS) rejects it with
@@ -448,9 +489,13 @@ function hasLiveChildProcesses(session: string, mcpPatterns: string[]): boolean 
  * snapshot only shows whatever the terminal painted last. Between two tool
  * calls the pane reads idle; the transcript does not.
  */
-function msSinceTranscriptWrite(workingDir: string, nowMs: number): number | null {
+function msSinceTranscriptWrite(workingDir: string, nowMs: number, configDir?: string): number | null {
   try {
-    const dir = projectsDirFor(workingDir)
+    // configDir matters MORE here than for the token read: a missing root makes
+    // this return a huge age, which reads as "quiet" and lets the gate clear a
+    // session that is in fact mid-turn. Fail-open, so it must use the same root
+    // the context read uses.
+    const dir = projectsDirFor(workingDir, configDir)
     if (!existsSync(dir)) return null
     let newest = 0
     for (const f of readdirSync(dir)) {
@@ -557,7 +602,11 @@ async function deliverPendingWake(name: string, session: string, nowMs: number):
   }
 
   try {
-    const outcome = await sendPromptToSession(session, gateWakePrompt(), null, {
+    // GUARDHITELES903: anchored in agent_messages so the fresh session can
+    // authenticate the "continue from the restored blocks" instruction. Same
+    // outcome contract as sendPromptToSession; a deferred (busy) attempt
+    // marks its anchor row failed and the retry creates a fresh one.
+    const outcome = await sendSystemDirective(name, session, gateWakePrompt(), null, {
       waitForIdle: true, onBusyTimeout: 'abort',
     })
     if (outcome === 'sent') {
@@ -599,7 +648,11 @@ export function gatherGateInputs(name: string, nowMs: number): GateSnapshot {
   })()
 
   const openQuestion = (() => {
-    try { return hasOpenInboundQuestion(agentIdForLedger(name)) }
+    try {
+      const ledgerId = agentIdForLedger(name)
+      return openQuestionBlocks(openInboundQuestionMessageId(ledgerId),
+                                drainSurfacedMessageId(ledgerId))
+    }
     catch { return false }
   })()
 
@@ -620,7 +673,7 @@ export function gatherGateInputs(name: string, nowMs: number): GateSnapshot {
     pendingOutboundCount:   dispatchedStats === null ? 1 : dispatchedStats.count,
     hasStaleOutbound:       dispatchedStats?.hasStale ?? false,
     hasChildProcesses:      childProcesses,
-    msSinceTranscriptWrite: msSinceTranscriptWrite(workingDir, nowMs),
+    msSinceTranscriptWrite: msSinceTranscriptWrite(workingDir, nowMs, configDirFor(name)),
     hasOpenQuestion:        openQuestion,
     hasLiveTaskState:       liveTaskState,
   }

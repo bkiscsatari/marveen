@@ -1,10 +1,10 @@
 {
   "name": "marveen",
-  "version": "1.36.0",
+  "version": "1.39.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/write-built-commit.cjs",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "setup": "tsx scripts/setup.ts",
@@ -18,10 +18,11 @@
     "skill": "tsx scripts/skill.ts",
     "channel": "node dist/channel-service.js",
     "channel:dev": "tsx src/channel-service.ts",
-    "morning:runtime": "tsx scripts/morning-briefing-runtime.ts"
+    "morning:runtime": "tsx scripts/morning-briefing-runtime.ts",
+    "browser-verify": "playwright test --config=playwright.browser.config.ts"
   },
   "engines": {
-    "node": ">=20 <24"
+    "node": ">=22"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.59",
@@ -33,7 +34,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@openrouter/ai-sdk-provider": "^3.1.0",
     "ai": "^7.0.109",
-    "better-sqlite3": "^11.7.0",
+    "better-sqlite3": "^13.0.3",
     "cron-parser": "^5.0.0",
     "grammy": "^1.46.0",
     "ollama-ai-provider-v2": "^4.0.1",
@@ -47,6 +48,6 @@
     "@types/node": "^22.10.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "^4.1.11"
   }
 }

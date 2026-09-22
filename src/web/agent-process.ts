@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync, renameSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync, renameSync, statSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { execFileSync } from 'node:child_process'
@@ -17,19 +17,27 @@ import {
   stripSessionTitleBanner,
   stripAllAnsi,
   paneShowsContextSaturation,
+  paneShowsContextSaturationHardError,
   idleConsideringDimGhost,
   detectsFirstRunGate,
   detectsModelConsentDialog,
   detectsFeedbackDraftModal,
   detectsFeedbackOptOutPrompt,
   firstRunAcceptKeys,
+  stuckInputSignature,
+  mcpTrustAcceptKeys,
   type FirstRunGateKind,
 } from '../pane-state.js'
-import { agentDir, listAgentNames, readAgentModel, readAgentClaudeConfigDir, readAgentClaudePlan, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost, readAgentMemoryIsolation } from './agent-config.js'
-import { resolveAgentConfigDir } from './claude-plans.js'
+import { scheduleRecoveryBrief } from './restart-recovery-brief.js'
+import { beginRestart, endRestart } from './restart-lock.js'
+import { agentDir, listAgentNames, readAgentModel, readAgentClaudeConfigDir, readAgentClaudePlan, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost, readAgentRunAsUser, readAgentMemoryIsolation, readAgentWorksourceChannel } from './agent-config.js'
+import { worksourceRootFor } from './worksource-queue.js'
+import { resolveAgentConfigDir, readClaudePlans, getClaudePlan } from './claude-plans.js'
+import { readClaudePlansState } from './claude-plans-state.js'
 import { provisionMemoryBoundaryDir } from './memory-boundary.js'
 import { renameSharedCredentialsIfSafe } from './claude-credentials-guard.js'
 import { atomicWriteFileSync } from './atomic-write.js'
+import { paneOneLine } from './pane-text.js'
 import { withSessionSendLock, tryAcquireSessionSendLane, type SendLockMode } from './session-send-lock.js'
 import {
   buildTmuxInvocation,
@@ -42,14 +50,16 @@ import {
   ensureControlDir,
   cleanStaleSshSockets,
   type AgentRunState,
+  type TmuxInvocation,
 } from './ssh-tmux.js'
 import { parseTelegramToken } from './telegram.js'
 import { getProvider, getProviderType, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE } from '../config.js'
 import { getEffectiveSettingValue } from '../settings-store.js'
+import { readEnvFile } from '../env.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
-import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureAutonomySection, ensureSkillsPathTrapSection } from './agent-scaffold.js'
+import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection } from './agent-scaffold.js'
 import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
 import { recordInjectedPrompt } from './injected-prompt-registry.js'
 import { getSecret } from './vault.js'
@@ -290,7 +300,24 @@ function maybeAlertSharedConfigCollision(name: string): void {
 //
 // Idempotent and best-effort: returns the dir on success, or null so the caller
 // falls back to the shared ~/.claude (degraded, but never a launch failure).
-const ISOLATED_CONFIG_SKIP = new Set(['settings.json', 'plugins', '.credentials.json'])
+// `projects` holds each session's transcript AND the auto-memory store, and the
+// memory store is keyed by PROJECT ROOT, not by cwd. Symlinking it to the shared
+// ~/.claude/projects therefore gives every agent on this install ONE memory store --
+// the main agent's. Measured on the Acrobot install 2026-08-18: the only memory/
+// directory under the shared tree was the main agent's (30 files), an agent's note
+// landed in the MAIN agent's MEMORY.md at 16:31, and a second agent watched a memory
+// written by the main agent appear in its own index minutes later. The link is live
+// and bidirectional, not just shared history.
+//
+// Skipping it here is what makes a per-agent split possible at all: the provisioner
+// runs on EVERY spawn and, finding a real directory where it expects a symlink,
+// deletes it (rmSync below) and re-links. A split done on disk therefore survived
+// seconds -- until the next agent start undid it. Fixing this in the filesystem is
+// not possible; the code that owns the path has to leave it alone.
+//
+// Consequence for a fresh agent: no `projects` entry is provisioned, and Claude Code
+// creates its own inside the isolated config dir. That is the intended end state.
+const ISOLATED_CONFIG_SKIP = new Set(['settings.json', 'plugins', '.credentials.json', 'projects'])
 
 export function ensureIsolatedChannelConfigDir(
   name: string,
@@ -346,7 +373,121 @@ export function ensureMainAgentIsolatedConfigDir(
     PROJECT_ROOT,
     getProviderType(provider),
     MAIN_AGENT_ID,
+    readExtraChannelPluginIds(),
   )
+}
+
+// READ-ONLY sibling of the two resolvers above: which config dir will the main
+// agent actually use, without provisioning anything. `null` means the shared
+// ~/.claude root, i.e. the same file the operator's own interactive sessions
+// read -- and a caller that must not touch the operator's shell has to treat
+// that as "no place of my own to write" rather than falling back to it.
+//
+// Same gates as ensureMainAgentIsolatedConfigDir (explicit dir wins; otherwise
+// the setting AND the fleet token AND the dir actually existing), deliberately
+// without its side effects, so a boot-time migration can ask the question
+// before the launcher has run.
+export function mainAgentConfigDirIfSeparate(): string | null {
+  const explicit = resolveMainAgentConfigDir()
+  if (explicit) return explicit
+  let enabled = false
+  try { enabled = String(getEffectiveSettingValue('MAIN_AGENT_ISOLATED_CONFIG')) === '1' } catch { return null }
+  if (!enabled) return null
+  if (!hasFleetOauthToken()) return null
+  const dir = join(PROJECT_ROOT, '.channels-config')
+  return existsSync(dir) ? dir : null
+}
+
+// CHANNEL_PLUGINS_EXTRA -- the co-listen plugins channels.sh appends to
+// --channels so ONE main session can serve several providers at once (e.g.
+// Telegram primary + Discord). Same .env key channels.sh parses, read here so
+// the isolated-config provisioner and the launcher cannot disagree.
+//
+// 2026-08-16 (Discord co-listen, ~2h silent outage): the provisioner rewrites
+// the isolated settings.json on EVERY channels.sh start and forced
+// scopeChannelPlugins(PRIMARY) -- which sets every OTHER channel plugin to
+// false. Claude Code then refuses to load the co-listen plugin no matter what
+// --channels says, so the Discord bot came up deaf: messages to it reached
+// nothing and the owner got no reply. Two manual fixes (hand-edited registry,
+// then `claude plugin install`) both looked correct and were both erased
+// seconds later by the next restart. Keeping the extras enabled here is the
+// only place that survives, because this function is what does the erasing.
+export function readExtraChannelPluginIds(): string[] {
+  try {
+    const raw = readEnvFile(['CHANNEL_PLUGINS_EXTRA'])['CHANNEL_PLUGINS_EXTRA'] ?? ''
+    return raw.split(/\s+/).map(s => s.trim()).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Which shared-root regression this main-agent launch is, if any.
+ *
+ * THE SHAPE THIS ANSWERS, AND WHY IT IS A FUNCTION AND NOT AN `if`. The same two
+ * triggers already live in scripts/channels.sh (the LOUD REGRESSION GUARD, two
+ * blocks): that path shouts when the main agent comes up on the shared
+ * ~/.claude. Every OTHER way the main session starts -- the nightly respawn, the
+ * stage-3 recovery resume, the hard restart -- bypasses channels.sh entirely and
+ * was therefore silent, which is what kanban card `guard-respawn-vak` is about.
+ * The 2026-08-04 outage ran from 03:00 to 07:58 unnoticed for exactly that
+ * reason: the one path that runs at night with nobody watching is the one path
+ * that could not speak.
+ *
+ * Deliberately PURE and state-injected: the caller reads the three facts, this
+ * decides. That keeps it testable without a filesystem, and -- more to the point
+ * -- keeps the DECISION in one place while the EMISSION stays at the call site,
+ * so a test of the decision can never be mistaken for proof that anyone acts on
+ * it.
+ *
+ * `null` means "nothing to warn about", which covers TWO different situations:
+ * isolation is on and working, OR this is a plain default install that never
+ * ran isolated and holds no fleet token. The second is the common case and must
+ * stay silent, or the guard becomes noise on every stock install.
+ */
+export type MainSharedConfigTrigger =
+  /** A fleet setup-token exists but the resolution came back empty: the setting
+   *  is missing, not declined. Shape of issue #835; the isolation-lost trigger
+   *  is structurally blind to it because there is no .channels-config dir yet. */
+  | 'fleet-token-unused'
+  /** This install HAS run isolated (its .channels-config is still on disk), yet
+   *  this launch resolved to the shared root -- so the setting was LOST, e.g.
+   *  store/config-overrides.json deleted with no .env key behind it. */
+  | 'isolation-lost'
+  | null
+
+export function mainSharedConfigTrigger(state: {
+  /** The resolved isolated CLAUDE_CONFIG_DIR, or null for the shared root. */
+  isolatedConfigDir: string | null
+  /** store/.claude-oauth-token present and non-empty. */
+  fleetToken: boolean
+  /** PROJECT_ROOT/.channels-config exists on disk. */
+  isolatedDirExists: boolean
+}): MainSharedConfigTrigger {
+  // Running isolated -- the whole point of the guard is already satisfied.
+  if (state.isolatedConfigDir) return null
+  // Order matters, and it mirrors channels.sh: the dir on disk is the stronger
+  // evidence (isolation demonstrably worked here once), so it wins when both
+  // could apply. Swapping these would report a LOST setting as a fresh install
+  // and send the operator to the wrong fix.
+  if (state.isolatedDirExists) return 'isolation-lost'
+  if (state.fleetToken) return 'fleet-token-unused'
+  return null
+}
+
+/** Reads the three facts mainSharedConfigTrigger decides on. Separate from the
+ *  decision so the decision needs no filesystem, and separate from the emitter
+ *  so the emitter can be swapped in a test. */
+export function readMainSharedConfigState(isolatedConfigDir: string | null): {
+  isolatedConfigDir: string | null
+  fleetToken: boolean
+  isolatedDirExists: boolean
+} {
+  return {
+    isolatedConfigDir,
+    fleetToken: hasFleetOauthToken(),
+    isolatedDirExists: existsSync(join(PROJECT_ROOT, '.channels-config')),
+  }
 }
 
 // An EXPLICIT config dir for the main channels agent (MAIN_AGENT_CONFIG_DIR),
@@ -375,6 +516,35 @@ export function resolveMainAgentConfigDir(): string | null {
   return dir
 }
 
+// The main agent's CLAUDE_CONFIG_DIR when the rotation side-car
+// (store/claude-plans-state.json, PR2c) has recorded an active plan for it.
+//
+// Unlike the isolated credential-less dir above, a plan's configDir carries
+// its OWN real login -- the operator ran `claude setup-token` into it
+// directly (design 6.5/4, same as the per-agent resolveAgentConfigDir path).
+// So this behaves like an EXPLICIT dir, not an isolated one: the caller
+// (main-agent-isolated-config.mjs) must NOT inject the fleet token here,
+// exactly as it would not for resolveMainAgentConfigDir()'s result.
+//
+// Gated the same way rotation itself is gated (design 6.2): only applies
+// when MAIN_AGENT_ISOLATED_CONFIG=1 AND 2+ plans are registered. Below
+// either threshold this returns null even if a stale activePlanByAgent entry
+// exists on disk, so turning rotation off (or dropping back to one plan)
+// cannot strand the main agent on a dir nobody is maintaining anymore.
+export function resolveMainAgentRotatedConfigDir(): string | null {
+  let isolationEnabled = false
+  try { isolationEnabled = String(getEffectiveSettingValue('MAIN_AGENT_ISOLATED_CONFIG')) === '1' } catch { return null }
+  if (!isolationEnabled) return null
+
+  if (readClaudePlans().length < 2) return null
+
+  const activeId = readClaudePlansState().activePlanByAgent[MAIN_AGENT_ID]
+  if (!activeId) return null
+
+  const plan = getClaudePlan(activeId)
+  return plan ? plan.configDir : null
+}
+
 // Shared provisioning core for BOTH the sub-agents (ensureIsolatedChannelConfigDir)
 // and the main agent (ensureMainAgentIsolatedConfigDir) -- one code path so the
 // two can never diverge. `cfg` is the isolated CLAUDE_CONFIG_DIR to create; `cwd`
@@ -393,9 +563,17 @@ export function resolveMainAgentConfigDir(): string | null {
 // this reconcile is exactly the path that starts rewriting the file regularly.
 // Fall back to 0600 (not the umask) when the target does not exist yet, since
 // the content class is the same either way.
-function writeJsonAtomic(path: string, value: unknown): void {
-  let mode = 0o600
-  try { mode = statSync(path).mode & 0o777 } catch { /* new file -> owner-only */ }
+function writeJsonAtomic(path: string, value: unknown, opts: { groupShared?: boolean } = {}): void {
+  // A per-user agent's config is written by the ROUTER but read by the AGENT, and
+  // they are different OS users. An atomic write hands the new file to whoever ran
+  // it, so a plain 0600 silently locks the agent out of its own config -- Claude
+  // Code then cannot read it, writes a brand-new profile, and the freshly stamped
+  // consent flags are gone. Measured 2026-08-19 on korall: three restarts, three
+  // fresh 8-key profiles, and the login picker every time with a valid token in
+  // the environment. Group-shared writes keep both sides able to read and write.
+  let mode = opts.groupShared ? 0o660 : 0o600
+  try { mode = statSync(path).mode & 0o777 } catch { /* new file -> see above */ }
+  if (opts.groupShared) mode |= 0o060
   const tmp = `${path}.tmp-${process.pid}`
   writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { mode })
   renameSync(tmp, path)
@@ -419,11 +597,27 @@ function writeJsonAtomic(path: string, value: unknown): void {
 //   - a server removed from the shared config is left in place,
 //   - a non-object mcpServers on either side means we do not touch it at all,
 //     because we cannot merge what we do not understand.
+//
+// AND NEVER ACROSS A SCOPE COLLISION (2026-09-05, measured 12-hour outage).
+// Claude Code resolves `local` scope (.claude.json) BEFORE `project` scope
+// (<cwd>/.mcp.json). Copying a shared entry whose name the agent already defines
+// in its own .mcp.json therefore does not fill a gap -- it SHADOWS the agent's
+// definition with the router's, credentials included. The failure is silent and
+// total: our shared `cortex` entry carried a token that is valid for the router
+// and unknown to the server, so every agent session that started after the
+// write-back answered the handshake with 401 and registered ZERO cortex tools,
+// while its own .mcp.json looked perfectly correct and the backend was healthy.
+// A restart never helped -- startup is what writes the shadow back. Two agents
+// lost the toolset for ~12 hours; the two whose sessions predated the write-back
+// kept working, which is what made it read as flaky client-side registration
+// instead of a config collision.
+// A name the agent already owns at project scope is NOT a gap. Skip it.
 // Returns true if the caller should persist `cur`.
 function reconcileMcpServers(
   cur: Record<string, unknown>,
   sharedDot: string,
   name: string,
+  cwd: string,
 ): boolean {
   if (!existsSync(sharedDot)) return false
   let shared: Record<string, unknown>
@@ -436,16 +630,63 @@ function reconcileMcpServers(
     return false
   }
   const own = isPlainObject(cur.mcpServers) ? cur.mcpServers : {}
+  const projectScoped = projectScopedServerNames(cwd)
   const added: string[] = []
+  const shadowed: string[] = []
   for (const [key, def] of Object.entries(shared.mcpServers)) {
     if (key in own) continue
+    if (projectScoped.has(key)) { shadowed.push(key); continue }
     own[key] = def
     added.push(key)
+  }
+  // Log the skips even when nothing was added: a silent skip is how this class
+  // of bug stays invisible, and the name alone tells the next reader where the
+  // agent's real definition lives.
+  if (shadowed.length > 0) {
+    logger.info(
+      { name, shadowed },
+      'isolated-config: skipped shared MCP servers the agent already defines in its own .mcp.json',
+    )
   }
   if (added.length === 0) return false
   cur.mcpServers = own
   logger.info({ name, added }, 'isolated-config: added missing MCP servers from the shared config')
   return true
+}
+
+// Drop from a to-be-written config every mcpServers entry whose name the agent
+// already owns at project scope. Used on the FIRST-SEED path, where the whole
+// shared config is copied: without this the very first launch of a new agent
+// starts out shadowed, which is the same outage as the gap-fill one, just
+// earlier. Mutates `cfg` in place.
+function stripProjectScopedCollisions(cfg: Record<string, unknown>, cwd: string, name: string): void {
+  const projectScoped = projectScopedServerNames(cwd)
+  if (projectScoped.size === 0) return
+  const dropped: string[] = []
+  if (isPlainObject(cfg.mcpServers)) {
+    for (const key of Object.keys(cfg.mcpServers)) {
+      if (projectScoped.has(key)) { delete (cfg.mcpServers as Record<string, unknown>)[key]; dropped.push(key) }
+    }
+  }
+  if (dropped.length > 0) {
+    logger.info(
+      { name, dropped },
+      'isolated-config: seed dropped shared MCP servers the agent defines in its own .mcp.json',
+    )
+  }
+}
+
+// Server names the agent already gets from its own project-scope <cwd>/.mcp.json.
+// A missing or unreadable file is not an error here: it just means the agent has
+// no project-scope servers, so nothing can collide.
+function projectScopedServerNames(cwd: string): Set<string> {
+  try {
+    const parsed = JSON.parse(readFileSync(join(cwd, '.mcp.json'), 'utf-8')) as Record<string, unknown>
+    if (!isPlainObject(parsed.mcpServers)) return new Set()
+    return new Set(Object.keys(parsed.mcpServers))
+  } catch {
+    return new Set()
+  }
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -457,6 +698,7 @@ function provisionIsolatedConfigDir(
   cwd: string,
   providerType: ChannelProviderType | null,
   name: string,
+  extraPluginIds: string[] = [],
 ): string | null {
   try {
     const realClaude = join(homedir(), '.claude')
@@ -467,8 +709,15 @@ function provisionIsolatedConfigDir(
     //    must stay out of the isolated dir (.credentials.json -- see header). A
     //    stale non-symlink (e.g. a prior copy, or a .credentials.json left by an
     //    earlier build) is removed so it can never shadow the env-var auth.
+    // A per-user agent cannot follow a symlink into the router's private home:
+    // `~/.claude/.claude.json` is 0600 and owned by the router's user, so the
+    // agent reads nothing, Claude Code writes a brand-new profile, and every
+    // consent flag the provisioner just stamped is gone -- which is exactly how
+    // an otherwise correctly authenticated agent lands on the login picker
+    // (measured on korall, 2026-08-19). It needs a REAL file of its own here.
+    const perUserAgent = readAgentRunAsUser(name) != null
     for (const entry of readdirSync(realClaude)) {
-      if (ISOLATED_CONFIG_SKIP.has(entry)) {
+      if (ISOLATED_CONFIG_SKIP.has(entry) || (perUserAgent && entry === '.claude.json')) {
         // Defensively drop a real .credentials.json that an older build may have
         // symlinked/copied here, so the env-var token is the only auth source.
         const stale = join(cfg, entry)
@@ -498,10 +747,25 @@ function provisionIsolatedConfigDir(
       try { settings = JSON.parse(readFileSync(sharedSettings, 'utf-8')) as Record<string, unknown> }
       catch { settings = {} }
     }
+    // #1305: hooks never ride the clone. Fleet hooks live in the PROJECT scope
+    // (tracked <root>/.claude/settings.json for the main agent, agents/<n>/
+    // .claude/ for sub-agents), which Claude Code loads by cwd regardless of
+    // CLAUDE_CONFIG_DIR. Copying the shared file's hooks here is what made the
+    // isolated dirs carry a second, derived copy of the user-global entries --
+    // it double-fired every gate (measured 2026-09-04: two identical
+    // PROVENANCE-KAPU blocks per prompt) and made the global file look load-
+    // bearing when it was not.
+    delete settings.hooks
     const scopedPlugins = scopeChannelPlugins(
       providerType,
       settings.enabledPlugins as Record<string, boolean> | undefined,
     )
+    // Re-enable the co-listen extras scopeChannelPlugins just turned off. The
+    // scope call exists to stop a SUB-agent fighting the main agent over the
+    // same poller slot; the main agent's own declared extras are the opposite
+    // case -- they are its channels, and forcing them false is what silently
+    // kills the second bot on every restart.
+    for (const pid of extraPluginIds) scopedPlugins[pid] = true
     settings.enabledPlugins = scopedPlugins
     // Keys the isolated file already carries that the shared file never
     // mentions must SURVIVE this rewrite. The rewrite runs on every main-agent
@@ -533,7 +797,11 @@ function provisionIsolatedConfigDir(
         if (isPlainObject(own)) {
           const inherited: string[] = []
           for (const [key, value] of Object.entries(own)) {
-            if (key !== 'enabledPlugins' && !(key in settings)) {
+            // 'hooks' is excluded here too: the shared copy just dropped it
+            // (#1305), so without this exclusion an isolated dir that already
+            // carries the old derived hooks would inherit them right back as a
+            // "target-only" key on every re-provision.
+            if (key !== 'enabledPlugins' && key !== 'hooks' && !(key in settings)) {
               settings[key] = value
               inherited.push(key)
             }
@@ -615,6 +883,9 @@ function provisionIsolatedConfigDir(
     //    Only seed when absent -- once Claude Code owns the file we leave its
     //    evolved state alone, just guaranteeing hasCompletedOnboarding stays set.
     try {
+      // Does this agent run as its own OS user? Then everything the router writes
+      // into its config dir has to stay readable AND writable for that user.
+      const perUser = readAgentRunAsUser(name) != null
       const dotClaude = join(cfg, '.claude.json')
       const sharedDot = join(homedir(), '.claude.json')
       if (!existsSync(dotClaude)) {
@@ -623,7 +894,12 @@ function provisionIsolatedConfigDir(
           try { seed = JSON.parse(readFileSync(sharedDot, 'utf-8')) as Record<string, unknown> } catch { /* keep minimal */ }
         }
         seed.hasCompletedOnboarding = true
-        writeJsonAtomic(dotClaude, seed)
+        // The seed is a FULL copy of the shared config, so it carries the same
+        // scope-collision risk as the gap-fill below: a shared entry whose name
+        // the agent owns in its own .mcp.json would arrive at local scope and
+        // shadow it, credentials included. Strip those before writing.
+        stripProjectScopedCollisions(seed, cwd, name)
+        writeJsonAtomic(dotClaude, seed, { groupShared: perUser })
       } else {
         try {
           const cur = JSON.parse(readFileSync(dotClaude, 'utf-8')) as Record<string, unknown>
@@ -632,8 +908,8 @@ function provisionIsolatedConfigDir(
             cur.hasCompletedOnboarding = true
             dirty = true
           }
-          if (reconcileMcpServers(cur, sharedDot, name)) dirty = true
-          if (dirty) writeJsonAtomic(dotClaude, cur)
+          if (reconcileMcpServers(cur, sharedDot, name, cwd)) dirty = true
+          if (dirty) writeJsonAtomic(dotClaude, cur, { groupShared: perUser })
         } catch { /* unparseable -> leave for Claude Code to recreate */ }
       }
     } catch (err) {
@@ -748,7 +1024,7 @@ export function stampProjectTrustForDir(dotClaudePath: string, projectDir: strin
 // Root cause chain (2026-07-23, card b71fc541): a config root without
 // fableOverageConsentV2[<orgUuid>] parks the first Fable 5 turn on a TUI
 // dialog whose DEFAULT option is "Switch to Sonnet 5 and continue". The
-// fleet's own blind Enters (identity /name, sendPromptToSession retry-Enter)
+// fleet's own blind Enters (identity /rename, sendPromptToSession retry-Enter)
 // accept that default, silently switching the session to Sonnet while
 // agent-config still says claude-fable-5 -- the long-unexplained
 // model/activeModel drift. Fleet policy (owner decision 2026-07-23): the
@@ -834,12 +1110,101 @@ export type ProviderKind = AnthropicCompatProvider
 // byte-identical to the prior direct local tmux call. Remote calls get a larger
 // default timeout because an ssh round-trip (handshake + remote exec) is slower
 // than a local fork; ServerAlive/ConnectTimeout in SSH_OPTS bound a dead host.
-function runTmux(host: string | null, tmuxArgs: string[], opts: { timeout?: number } = {}): void {
+// Where a tmux call has to land: a remote host, a local user other than the
+// router's own, or (the default everywhere today) plain local. Callers may pass
+// the bare host string they already hold; only the agent-aware call sites build
+// the full target.
+export type TmuxTarget = { host: string | null; runAsUser?: string | null }
+
+function asTarget(t: string | null | TmuxTarget): TmuxTarget {
+  return typeof t === 'string' || t === null ? { host: t } : t
+}
+
+// The tmux target for one agent: remote host if configured, otherwise the OS
+// user it runs as (null = the router's own user).
+export function agentTmuxTarget(name: string): TmuxTarget {
+  return { host: readAgentRemoteHost(name), runAsUser: readAgentRunAsUser(name) }
+}
+
+// Fallback identity resolution for the many callers that only ever knew a host.
+//
+// The router reaches an agent from a dozen places (message delivery, context
+// guard, inbox nudge, worker, channel monitor) and most of them hold nothing but
+// the SESSION NAME. Threading an agent identity through every one of those call
+// chains at once would be a large, risky change; this closes the gap without it:
+// when a local call names a session that belongs to an agent with its own OS
+// user, run it as that user.
+//
+// Deliberate limits: the session name comes from tmux's own `-t` / `-s` flag (not
+// from parsing free text), the answer comes from the agent's CONFIG (not from the
+// name itself), and it only ever applies when the caller passed no host and no
+// explicit user. An unknown session resolves to null and behaves exactly as before.
+let sessionUserCache: { at: number; map: Map<string, string> } | null = null
+
+function sessionRunAsUserMap(): Map<string, string> {
+  const now = Date.now()
+  if (sessionUserCache && now - sessionUserCache.at < 5000) return sessionUserCache.map
+  const map = new Map<string, string>()
+  try {
+    for (const n of listAgentNames()) {
+      const u = readAgentRunAsUser(n)
+      if (u) map.set(agentSessionName(n), u)
+    }
+  } catch { /* a config read failure must never break a tmux call */ }
+  sessionUserCache = { at: now, map }
+  return map
+}
+
+export function runAsUserForTmuxArgs(tmuxArgs: string[], map: Map<string, string>): string | null {
+  for (let i = 0; i < tmuxArgs.length - 1; i++) {
+    if (tmuxArgs[i] !== '-t' && tmuxArgs[i] !== '-s') continue
+    // `-t agent-x:0.1` addresses a window/pane inside the same session.
+    const session = tmuxArgs[i + 1].split(':')[0]
+    const user = map.get(session)
+    if (user) return user
+  }
+  return null
+}
+
+function resolveTarget(target: string | null | TmuxTarget, tmuxArgs: string[]): TmuxTarget {
+  const t = asTarget(target)
+  if (t.host || t.runAsUser) return t
+  return { host: null, runAsUser: runAsUserForTmuxArgs(tmuxArgs, sessionRunAsUserMap()) }
+}
+
+// The ONE place that turns tmux args into a runnable {file, args}: it resolves
+// the target (remote host, or the agent's own OS user) and hands back the exact
+// invocation runTmux would use. Exported because not every tmux call in the
+// router is synchronous -- the dashboard terminal (routes/agent-terminal.ts)
+// needs the same resolution from an async execFile.
+//
+// Why it exists (measured 2026-08-26 22:15 and again 2026-08-27 22:0x, two live
+// cases): agent-terminal.ts called the raw tmux binary, so for an agent running
+// under its own OS user BOTH the live pane stream and the /keys write failed --
+// the pane rendered empty and send-keys answered 500. The operator could not
+// answer a permission prompt from the dashboard while two agents sat blocked for
+// ten minutes. A second copy of the local-vs-remote-vs-runAsUser decision is the
+// bug; this export is the fix.
+export function tmuxInvocationFor(tmuxArgs: string[], target: string | null | TmuxTarget = null): TmuxInvocation {
+  const { host, runAsUser } = resolveTarget(target, tmuxArgs)
   // Ensure the private ControlMaster socket dir exists before ANY remote ssh
   // call (idempotent, ~free). Without this a watcher-first remote call after a
   // marveen restart would lose connection multiplexing and re-handshake each tick.
   if (host) ensureControlDir()
-  const inv = buildTmuxInvocation(host, tmuxBin(), tmuxArgs)
+  return buildTmuxInvocation(host, tmuxBin(), tmuxArgs, 'tmux', runAsUser ?? null)
+}
+
+// True when this tmux call has to be routed through another OS user or host --
+// i.e. when a raw `tmux` binary call would silently fail. Used by callers that
+// keep their own child-process plumbing but must not skip the resolution.
+export function tmuxNeedsIndirection(tmuxArgs: string[], target: string | null | TmuxTarget = null): boolean {
+  const { host, runAsUser } = resolveTarget(target, tmuxArgs)
+  return host != null || runAsUser != null
+}
+
+function runTmux(target: string | null | TmuxTarget, tmuxArgs: string[], opts: { timeout?: number } = {}): void {
+  const { host } = resolveTarget(target, tmuxArgs)
+  const inv = tmuxInvocationFor(tmuxArgs, target)
   // stdio: capture the child's stderr into the thrown error instead of letting
   // execFileSync's default inherit it to the parent stderr. A restarting agent
   // makes tmux emit `can't find session: agent-X` / `no server running`; without
@@ -848,9 +1213,9 @@ function runTmux(host: string | null, tmuxArgs: string[], opts: { timeout?: numb
   execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), stdio: ['ignore', 'ignore', 'pipe'] })
 }
 
-function captureTmux(host: string | null, tmuxArgs: string[], opts: { timeout?: number } = {}): string {
-  if (host) ensureControlDir()
-  const inv = buildTmuxInvocation(host, tmuxBin(), tmuxArgs)
+function captureTmux(target: string | null | TmuxTarget, tmuxArgs: string[], opts: { timeout?: number } = {}): string {
+  const { host } = resolveTarget(target, tmuxArgs)
+  const inv = tmuxInvocationFor(tmuxArgs, target)
   // stdout piped (we return it); stderr piped too so tmux's `can't find session`
   // noise lands in err.stderr on failure rather than the parent stderr / dashboard.log.
   return execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -861,9 +1226,10 @@ function captureTmux(host: string | null, tmuxArgs: string[], opts: { timeout?: 
 // an SSH drop must never read as 'stopped', which would trigger a wrong
 // auto-restart or a duplicate start). See classifyRunState.
 export function agentRunState(name: string): AgentRunState {
-  const host = readAgentRemoteHost(name)
+  const target = agentTmuxTarget(name)
+  const host = target.host
   try {
-    const out = captureTmux(host, ['list-sessions', '-F', '#{session_name}'])
+    const out = captureTmux(target, ['list-sessions', '-F', '#{session_name}'])
     return classifyRunState(out, agentSessionName(name), host != null)
   } catch (err) {
     // tmux list-sessions exits non-zero ("no server running") when there are
@@ -887,16 +1253,26 @@ export function isAgentRunning(name: string): boolean {
 // matching the local "session not found" semantics.
 export function sessionExistsOnHost(host: string | null, session: string): boolean {
   try {
-    return sessionInList(captureTmux(host, ['list-sessions', '-F', '#{session_name}']), session)
+    // `list-sessions` carries no -t/-s, so the args-based fallback cannot see
+    // whose session this is -- and a per-user agent's session lives on ITS OWN
+    // tmux server, invisible from the router's. Without this lookup the readiness
+    // check answers "no such session" for a perfectly healthy agent and every
+    // message to it stays queued forever (measured on korall, 2026-08-19: the
+    // session was up, the pane idle, and two messages sat pending).
+    const target: TmuxTarget = host
+      ? { host }
+      : { host: null, runAsUser: sessionRunAsUserMap().get(session) ?? null }
+    return sessionInList(captureTmux(target, ['list-sessions', '-F', '#{session_name}']), session)
   } catch {
     return false
   }
 }
 
-export function getAgentRunningSince(name: string): number | null {
+export function getAgentRunningSince(name: string, session: string = agentSessionName(name)): number | null {
   try {
-    const host = readAgentRemoteHost(name)
-    const out = captureTmux(host, ['display-message', '-p', '-t', agentSessionName(name), '#{session_created}']).trim()
+    const target = agentTmuxTarget(name)
+    const host = target.host
+    const out = captureTmux(target, ['display-message', '-p', '-t', session, '#{session_created}']).trim()
     const ts = parseInt(out, 10)
     return Number.isFinite(ts) ? ts : null
   } catch {
@@ -979,6 +1355,27 @@ function startRemoteAgentProcess(
   }
 }
 
+/**
+ * Does a start that just happened deserve a recovery brief?
+ *
+ * Only a FRESH start: a --continue resume still has the conversation, so the
+ * agent already knows what it was doing, and a brief there would repeat it.
+ * And only a start that actually succeeded -- briefing a session that never
+ * came up would type into whatever is on that tmux target next.
+ *
+ * Card 3a64403b covered the channel-monitor door. The measurement that
+ * followed found three more (context-guard restart, auto-restart in fresh
+ * mode, and the dashboard's own restart button), which is why the decision
+ * now lives here, at the one place all of them pass through, rather than at
+ * each caller.
+ */
+export function shouldBriefAfterStart(
+  opts: { fresh?: boolean },
+  result: { ok: boolean },
+): boolean {
+  return opts.fresh === true && result.ok
+}
+
 export async function startAgentProcess(name: string, opts: { fresh?: boolean } = {}): Promise<{ ok: boolean; pid?: number; error?: string }> {
   const dir = agentDir(name)
   if (!existsSync(dir)) return { ok: false, error: 'Agent not found' }
@@ -1046,7 +1443,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
 
   try {
     try {
-      runTmux(null, ['kill-session', '-t', session])
+      runTmux(agentTmuxTarget(name), ['kill-session', '-t', session])
       await delay(3000)
     } catch { /* ok */ }
 
@@ -1059,7 +1456,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     try {
       const agentProvider = resolveAgentProvider(name)
       const dir = agentDir(name)
-      reapChannelOrphans(agentProvider, dir)
+      reapChannelOrphans(agentProvider, dir, { tmuxPath: tmuxBin() })
     } catch (err) {
       logger.warn({ err, name }, 'pre-launch channel-poller reap failed (continuing)')
     }
@@ -1114,6 +1511,11 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     ensureFleetRosterSection(name)
     ensureAutonomySection(name)
     ensureSkillsPathTrapSection(name)
+    ensureSystemDirectiveAuthSection(name)
+    ensureMemorySearchLabelSection(name)
+    ensureFleetAuthSection(name)
+    ensureEvidenceSection(name)
+    ensureMcpListChannelSection(name)
     // A sub-agent must load ONLY its own channel plugin. The user-scope
     // enabledPlugins would otherwise make EVERY sub-agent spawn a telegram
     // (and slack/discord) poller that falls back to the main agent's bot
@@ -1177,6 +1579,70 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
       }
     }
 
+    // ---- worksource channel (opt-in per agent, default OFF) ----
+    //
+    // Registers the queue reader as a project-scope stdio MCP server and asks
+    // Claude Code to treat it as a CHANNEL, so a queued item arrives as a real
+    // turn instead of being typed into the pane.
+    //
+    // NOT gated on `hasChannel`, deliberately. `hasChannel` means "this agent
+    // has a chat-provider bot token", and it arms the plugin watchdog, the /mcp
+    // unlock driver and `--continue` suppression. A worksource agent runs no bot
+    // poller, so borrowing that flag would make the watchdog hunt for a poller
+    // that does not exist, read it as "plugin down", and restart the agent on a
+    // loop. The two channel kinds stay orthogonal; an agent may have either,
+    // both, or neither.
+    //
+    // Merged into the SAME .mcp.json the telegram tee writes above, never
+    // overwriting it: an agent can legitimately have both a chat channel and a
+    // work queue, and clobbering the file would silence the bot.
+    //
+    // Why the `--dangerously-load-development-channels` flag: Claude Code keeps
+    // an allowlist of approved channel plugins and SILENTLY DISCARDS channel
+    // notifications from anything else -- the server looks healthy in /mcp and
+    // nothing ever arrives. worksource is a local plugin, not a marketplace one,
+    // so it is off that list by construction. The flag is scoped to exactly the
+    // agents that opted in, and those agents load only the .mcp.json this code
+    // writes; it is not applied fleet-wide. (An `allowedChannelPlugins` entry in
+    // managed settings is the non-dev route, but it is keyed by plugin +
+    // marketplace, which a local plugin has no id in.)
+    let worksourceFlags = ''
+    if (readAgentWorksourceChannel(name) && name !== MAIN_AGENT_ID) {
+      try {
+        const serverPath = join(PROJECT_ROOT, 'plugins', 'worksource', 'server.mjs')
+        if (!existsSync(serverPath)) throw new Error(`worksource server not found at ${serverPath}`)
+        const mcpJsonPath = join(agentDir(name), '.mcp.json')
+        let mcpConfig: { mcpServers: Record<string, unknown> } = { mcpServers: {} }
+        try {
+          const existing = JSON.parse(readFileSync(mcpJsonPath, 'utf-8')) as { mcpServers?: Record<string, unknown> }
+          if (existing && typeof existing === 'object' && existing.mcpServers) mcpConfig = { mcpServers: existing.mcpServers }
+        } catch { /* absent or unreadable -> start from empty, do not fail the launch */ }
+        mcpConfig.mcpServers.worksource = {
+          command: process.execPath,
+          args: [serverPath],
+          // Passed as MCP server env rather than shell exports: the values are
+          // agent-derived paths and this keeps them out of the launch command
+          // string entirely, so there is nothing to quote and nothing to escape.
+          env: { WORKSOURCE_AGENT_ID: name, WORKSOURCE_DIR: worksourceRootFor(name) },
+        }
+        writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2))
+        // The dev-channels flag takes a TAGGED LIST (`server:<name>` for a manually
+        // configured MCP server, `plugin:<name>@<marketplace>` for a plugin one).
+        // Measured by the reviewer on the PR head: without the value the CLI exits
+        // with `option '--dangerously-load-development-channels <servers...>'
+        // argument missing`, i.e. a worksourceChannel agent could not start AT ALL
+        // -- not "the plugin is skipped", the process died. (2026-09-03, PR #1099.)
+        worksourceFlags = ' --channels server:worksource --dangerously-load-development-channels server:worksource'
+        logger.info({ name, serverPath }, 'worksource channel wired for agent')
+      } catch (err) {
+        // Fail OPEN, on purpose: a worksource agent that comes up without its
+        // queue channel still gets its work, because the router leaves the items
+        // in pending/ and the reader delivers them on the next successful start.
+        // Refusing to launch would trade a delayed message for a dead agent.
+        logger.warn({ err, name }, 'Could not wire worksource channel; agent starts without it')
+      }
+    }
+
     if (name !== MAIN_AGENT_ID) {
       const settingsPath = join(agentDir(name), '.claude', 'settings.json')
       try {
@@ -1236,7 +1702,15 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // stable token instead -- this is what makes the Linux credentials-guard
     // rename safe (a shared sub-agent with no env token would otherwise be
     // locked out once credentials.json is moved aside). No-op without a token.
-    if (!claudeConfigDir && hasFleetOauthToken()) {
+    // authMode 'own_team' (OWNTEAMVAK914): the operator explicitly opted this
+    // agent OUT of the fleet credential -- it authenticates from its OWN
+    // /login credential (dashboard auth-flow -> /login in the agent's tmux).
+    // The fleet token must therefore never be exported for it: Claude Code
+    // falls back to CLAUDE_CODE_OAUTH_TOKEN whenever the on-disk/Keychain
+    // credential is absent or expired, which would silently put the agent
+    // back on the shared identity -- exactly what own_team excludes.
+    const isOwnTeam = isClaude && authMode === 'own_team'
+    if (!claudeConfigDir && hasFleetOauthToken() && !isOwnTeam) {
       oauthTokenEnv = `export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')" && `
     }
     // Isolation must also cover CHANNEL-LESS Claude-OAuth agents, not just
@@ -1249,9 +1723,35 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // 2026-07-25). Only agents that never touch Anthropic OAuth stay on the
     // shared root: local/BYO-endpoint models (Ollama/DeepSeek/OpenRouter) and
     // per-agent API-key (authMode 'api') agents.
-    const needsFleetOauth = isClaude && authMode !== 'api'
-    if (!claudeConfigDir && (hasChannel || needsFleetOauth) && name !== MAIN_AGENT_ID) {
-      if (hasFleetOauthToken()) {
+    const needsFleetOauth = isClaude && authMode !== 'api' && !isOwnTeam
+    if (!claudeConfigDir && (hasChannel || needsFleetOauth || isOwnTeam) && name !== MAIN_AGENT_ID) {
+      if (isOwnTeam) {
+        // own_team isolates WITHOUT the fleet token: the isolated dir is where
+        // the agent's own /login credential lives (macOS Keychain scopes the
+        // entry per CLAUDE_CONFIG_DIR -- service name carries a sha256 prefix
+        // of the dir -- and on Linux the provisioner deliberately never
+        // touches .credentials.json, see ISOLATED_CONFIG_SKIP), so the
+        // isolation gate must NOT be hasFleetOauthToken() here.
+        const isolated = ensureIsolatedChannelConfigDir(name, hasChannel ? agentProvider : null)
+        if (isolated) {
+          claudeConfigDir = isolated
+          // Linux keeps the credential as a file, so its absence is reliably
+          // detectable; on macOS it lives in the Keychain (service-name
+          // convention is Claude Code internal, probing it each spawn would
+          // false-alarm across versions), so first-run there surfaces as the
+          // login screen plus this info line.
+          if (process.platform !== 'darwin' && !existsSync(join(isolated, '.credentials.json'))) {
+            logger.warn({ name }, 'own_team auth: no .credentials.json in the isolated config dir yet -- run the dashboard auth flow (/login) or the agent parks on the login screen')
+          } else {
+            logger.info({ name }, 'own_team auth: fleet token not exported; agent authenticates from its own login credential in the isolated config dir')
+          }
+        } else {
+          // Falling back to the shared ~/.claude would put the agent on the
+          // OWNER's rotating credential -- the opposite of own_team. Loud.
+          logger.warn({ name }, 'own_team auth: isolated config dir provisioning failed; agent falls back to the shared ~/.claude and will use the HOST credential, not its own Team login')
+          if (hasChannel) maybeAlertSharedConfigCollision(name)
+        }
+      } else if (hasFleetOauthToken()) {
         // Token present -> isolation works; any earlier degradation is resolved,
         // so re-arm the one-shot alert for a future token loss.
         resetSharedConfigCollisionAlert()
@@ -1359,7 +1859,18 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // re-submitted and cancelled a live invoice; an earlier ghost emailed a family
     // member. Killing the suggestion at the source removes the ghost the recovery
     // misreads. Env var verified present in claude.exe (CLAUDE_CODE_ENABLE_*).
-    const promptSuggestionEnv = 'export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false && '
+    // Same class, second source: the optional session-feedback survey
+    // ("How is Claude doing this session?  1: Bad  2: Fine  3: Good  0: Dismiss")
+    // waits on a keypress, and in an unattended agent nobody ever presses one --
+    // the session then takes no further turn at all. Measured 2026-09-11: FOUR
+    // agents stood frozen on it at the same time, one of them for 23 HOURS, while
+    // every external indicator stayed green -- running=true, messages
+    // status='delivered' (which only means the text was written INTO THE PANE, not
+    // that it was processed), pending=0, no error, scheduler silent. Three
+    // restarts did not clear it; one keypress did. Env var verified present in the
+    // shipped binary's CLAUDE_CODE_DISABLE_* table (2.1.205).
+    const promptSuggestionEnv =
+      'export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 && '
     // Disable Claude Code's in-place auto-updater for every spawned agent. A
     // running agent whose updater fires does an in-place global reinstall into the
     // shared package prefix; a half-completed update can leave a broken stub and
@@ -1371,10 +1882,23 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // values like `claude-opus-4-8[1m]` (1M-context suffix) from being glob-expanded AND makes a `'`
     // in the value inert rather than a quote-break -> command injection. Same escape at the three
     // ANTHROPIC_MODEL env sites above.
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${providerEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${extraMcpFlag}${channelFlag}`.trimEnd()
-    runTmux(null, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
+    // A per-user agent shares its directory with the router (group `fleet`), and
+    // the router still provisions into it on every start -- so files the agent
+    // creates must stay group-writable. Without this the default 022 umask writes
+    // 0600 files that the router can no longer stamp; measured 2026-08-19, that is
+    // exactly how korall lost its `hasCompletedOnboarding` flag on every restart
+    // and parked on the login picker with a perfectly good token in its env.
+    const umaskPrefix = agentTmuxTarget(name).runAsUser ? 'umask 002 && ' : ''
+    const cmd = `${umaskPrefix}export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${providerEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${extraMcpFlag}${channelFlag}${worksourceFlags}`.trimEnd()
+    // The agent's own target: for a per-user agent this is what makes the whole
+    // session (and every process inside it) belong to that uid. Passing null here
+    // silently started it as the router's user -- measured 2026-08-19: the start
+    // reported ok, no session existed under the agent's user, and the first
+    // capture-pane failed against the router's empty tmux server.
+    const startTarget = agentTmuxTarget(name)
+    runTmux(startTarget, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
 
-    logger.info({ name, session, channelDir: agentChannelDir }, 'Agent tmux session started')
+    logger.info({ name, session, channelDir: agentChannelDir, runAsUser: startTarget.runAsUser ?? null }, 'Agent tmux session started')
 
     // After a restart with --continue, a session that's been idle for >24h
     // shows the "Resume from summary" modal before the prompt input is ready
@@ -1409,6 +1933,16 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
       schedulePluginUnlockAfterRespawn(session, provider.type)
     }
 
+    // A fresh session has no memory of what the agent was doing. Every fresh
+    // door passes here -- the channel monitor's watchdog, the context guard,
+    // auto-restart in fresh mode, and the dashboard button -- so the brief is
+    // scheduled once, at the door, instead of at each caller (card 3a64403b).
+    if (shouldBriefAfterStart(opts, { ok: true })) {
+      scheduleRecoveryBrief(name, session, (target, text) =>
+        sendPromptToSession(target, text, null, { lockMode: 'deliver' }),
+      )
+    }
+
     return { ok: true }
   } catch (err) {
     logger.error({ err, name }, 'Failed to start agent tmux session')
@@ -1420,10 +1954,11 @@ export async function stopAgentProcess(name: string): Promise<{ ok: boolean; err
   const session = agentSessionName(name)
   if (!isAgentRunning(name)) return { ok: false, error: 'Agent is not running' }
 
-  const host = readAgentRemoteHost(name)
+  const target = agentTmuxTarget(name)
+  const host = target.host
 
   try {
-    runTmux(host, ['kill-session', '-t', session], { timeout: 5000 })
+    runTmux(target, ['kill-session', '-t', session], { timeout: 5000 })
     await delay(2000)
     // Reap any orphaned plugin grandchild that tmux did not tear down. This is
     // a LOCAL pkill against this host's process table, so it only makes sense
@@ -1433,7 +1968,7 @@ export async function stopAgentProcess(name: string): Promise<{ ok: boolean; err
       try {
         const agentProvider = resolveAgentProvider(name)
         const dir = agentDir(name)
-        reapChannelOrphans(agentProvider, dir)
+        reapChannelOrphans(agentProvider, dir, { tmuxPath: tmuxBin() })
       } catch (err) {
         logger.warn({ err, name }, 'post-stop channel-poller reap failed')
       }
@@ -1456,11 +1991,37 @@ export function getAgentProcessInfo(name: string): { running: boolean; session?:
 }
 
 export async function restartAgentProcess(name: string, opts: { fresh?: boolean } = {}): Promise<{ ok: boolean; pid?: number; error?: string }> {
-  if (isAgentRunning(name)) {
-    const stopResult = await stopAgentProcess(name)
-    if (!stopResult.ok) return { ok: false, error: stopResult.error || 'Failed to stop running agent before restart' }
+  // Hold the restart slot across BOTH halves. stopAgentProcess waits ~2s for
+  // tmux to tear the session down, and for that window isAgentRunning() already
+  // says false -- every liveness-driven supervisor (channel-monitor reconcile,
+  // schedule-runner auto-start, reauth-healer) would otherwise start the agent
+  // with ITS options and win the race. See restart-lock.ts for the measured
+  // levente case: the context-guard's fresh rescue was overtaken twice by a
+  // --continue reconcile start, which resumed the very 100%-context session the
+  // rescue existed to drop.
+  if (!beginRestart(name)) {
+    return { ok: false, error: 'A restart is already in flight for this agent' }
   }
-  return startAgentProcess(name, opts)
+  try {
+    if (isAgentRunning(name)) {
+      const stopResult = await stopAgentProcess(name)
+      if (!stopResult.ok) return { ok: false, error: stopResult.error || 'Failed to stop running agent before restart' }
+    }
+    const started = await startAgentProcess(name, opts)
+    // Losing the start race must NEVER read as success: the session that is up
+    // is somebody else's, launched with somebody else's options, and a caller
+    // that treats this as done (the context guard does) goes on to inject a
+    // resume prompt into a session it did not create. Loud, and !ok.
+    if (!started.ok && /already running/i.test(started.error ?? '')) {
+      logger.error(
+        { name, opts, error: started.error },
+        'Restart lost the start race -- another supervisor started this agent inside the stop window',
+      )
+    }
+    return started
+  } finally {
+    endRestart(name)
+  }
 }
 
 // Claude Code occasionally pops a "How is Claude doing this session? (optional)"
@@ -1538,12 +2099,28 @@ export async function dismissResumeSummaryModalIfPresent(session: string, host: 
 // Returns true only if the modal was actually there AND the pane became ready
 // after clearing it -- a false keeps the caller on its existing skip path, so
 // nothing about the busy case changes.
+//
+// PANEWRITERS910: the dismissal keystrokes run under the per-pane send lane,
+// fail-closed (same contract as sendPromptToSession's pre-emit dismissals and
+// scheduleIdentitySetup's modal span). All four refusal-branch callers run on
+// their own timers, so without the lane this could press '0'/Escape into a
+// pane mid-delivery. A busy lane returns false: the holder is a delivery,
+// which runs its own pre-emit dismissals, so skipping loses nothing.
 export async function clearFeedbackModalAndRecheck(session: string, host: string | null = null): Promise<boolean> {
   try {
     const pane = capturePane(session, host)
     if (pane == null || !detectsFeedbackDraftModal(pane)) return false
-    logger.warn({ session }, 'pane held by a Claude Code feedback-draft modal on the not-ready path, dismissing')
-    await dismissFeedbackDraftModalIfPresent(session, host)
+    const releaseLane = tryAcquireSessionSendLane(session, host)
+    if (!releaseLane) {
+      logger.info({ session }, 'feedback-draft modal dismissal skipped -- a delivery holds this pane send lane (fail-closed)')
+      return false
+    }
+    try {
+      logger.warn({ session }, 'pane held by a Claude Code feedback-draft modal on the not-ready path, dismissing')
+      await dismissFeedbackDraftModalIfPresent(session, host)
+    } finally {
+      releaseLane()
+    }
     return await isSessionReadyForPrompt(session, host)
   } catch (err) {
     logger.warn({ err, session }, 'Failed to clear the feedback-draft modal on the not-ready path')
@@ -1659,6 +2236,22 @@ export async function answerFirstRunGates(
           runTmux(host, ['send-keys', '-t', session, k], { timeout: 5000 })
           await delay(150)
         }
+      } else if (gate === 'mcp-trust') {
+        // MCP server-approval dialog. Cursor-relative, never by number, and
+        // never option 2 ("all future MCP servers") -- see mcpTrustAcceptKeys.
+        const keys = pane != null ? mcpTrustAcceptKeys(pane) : null
+        if (keys == null) {
+          // No unambiguous "use THIS server" row. Enter would confirm whatever
+          // is highlighted (option 3 is "Continue without using this MCP
+          // server", i.e. a silently channel-less agent), so park instead.
+          logger.warn({ session, gate },
+            'MCP approval dialog: no unambiguous "use this server" option found -- parking, NO keystrokes sent')
+          return 'blocked'
+        }
+        for (const k of keys) {
+          runTmux(host, ['send-keys', '-t', session, k], { timeout: 5000 })
+          await delay(150)
+        }
       } else {
         // theme / welcome: Enter accepts the highlighted default and moves on.
         runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
@@ -1675,12 +2268,15 @@ export async function answerFirstRunGates(
 }
 
 // Post-(re)start identity setup. Every freshly spawned Claude Code session is
-// given `/name` so it is identifiable. (`/remote-control` was dropped: the
+// given `/rename <name>` so it is identifiable. NOT `/name`: no such Claude
+// Code command exists (the CLI answers "Unknown command: /name. Did you mean
+// /rename?"), and the failed line then sits PARKED in the input box until the
+// turn ends -- which makes the router read the session as busy. (`/remote-control` was dropped: the
 // operator no longer uses Remote Control, and the agent's inference-only OAuth
 // token can't satisfy it anyway.) Pure helper for the exact slash commands so
 // they are unit-tested; scheduleIdentitySetup wires them to tmux after a wait.
 export function identitySlashCommands(displayName: string): string[] {
-  return [`/name ${displayName}`]
+  return [`/rename ${displayName}`]
 }
 
 // Delays mirror the observed Claude Code first-render timing: the first-run /
@@ -1689,34 +2285,90 @@ export function identitySlashCommands(displayName: string): string[] {
 const MODAL_DISMISS_DELAY_MS = 8000
 const IDENTITY_SEND_DELAY_MS = 5000
 
+// How many times the identity send retries when the pane's send lane is held
+// by a live delivery, and how long it waits between tries. Unlike the modal
+// dismissals (skip-on-busy is harmless -- a modal that is really up keeps the
+// pane non-idle and the next writer's own gate handles it), a SKIPPED /rename
+// leaves the session unnamed for its whole life, so this one waits its turn.
+// 5 x 3s spans a typical chunked delivery without holding the lane itself.
+const IDENTITY_LANE_RETRY_MS = 3000
+const IDENTITY_LANE_MAX_ATTEMPTS = 5
+
 // Schedule the identity setup for a freshly (re)spawned session: once it has
-// had time to render, dismiss any first-run/resume modals, then send `/name`.
+// had time to render, dismiss any first-run/resume modals, then send `/rename`.
 // Shared by startAgentProcess and the channel-monitor recovery respawns
 // (resumeMarveenSession / respawnMarveenSessionFresh), which previously left the
 // main session without its identity after auto-recovery. Fire-and-forget; all
 // errors are swallowed/logged so a missed setup never tears down the caller.
+//
+// IDENTLANE910: both pane-touching spans run INSIDE the per-pane send lane.
+// This writer was the one DELIVLOCK805 (#885) and PANEWRITERS805 (#895) missed:
+// it typed `/rename <name>` with a bare `runTmux(['send-keys', ...])` on a
+// fire-and-forget timer, outside the lane. Measured 2026-09-10 09:40:01: an
+// update.sh restart fired identity setup while the scheduler was chunk-pasting
+// a task prompt into the SAME pane, and `/rename Marveen_is` spliced into the
+// MIDDLE of that prompt -- between two words of a python expression on line 100
+// of the task's SKILL.md. The prompt file on disk was clean, so the splice
+// happened in transit. Reading agent saw an unprovenanced self-rename command
+// embedded in its own instructions; it did not execute it, but a writer that
+// can inject arbitrary text into another writer's framed message is exactly the
+// defect class #885 closed for deliveries.
 export async function scheduleIdentitySetup(session: string, displayName: string, host: string | null = null): Promise<void> {
   setTimeout(() => {
     void (async () => {
-      try {
-        await dismissSurveyModalIfPresent(session, host)
-        await dismissResumeSummaryModalIfPresent(session, host)
-        await dismissModelConsentDialogIfPresent(session, host)
-        await dismissFeedbackDraftModalIfPresent(session, host)
-      } catch (err) {
-        logger.warn({ err, session }, 'Post-restart modal dismiss failed')
+      // Modal dismissals: fail-closed acquire, same as sendPromptToSession's
+      // pre-emit dismissals. Skipping on a busy lane is safe here -- a delivery
+      // holding the lane runs its OWN dismissals before emitting.
+      const releaseDismissLane = tryAcquireSessionSendLane(session, host)
+      if (releaseDismissLane) {
+        try {
+          await dismissSurveyModalIfPresent(session, host)
+          await dismissResumeSummaryModalIfPresent(session, host)
+          await dismissModelConsentDialogIfPresent(session, host)
+          await dismissFeedbackDraftModalIfPresent(session, host)
+        } catch (err) {
+          logger.warn({ err, session }, 'Post-restart modal dismiss failed')
+        } finally {
+          releaseDismissLane()
+        }
+      } else {
+        logger.info({ session }, 'Identity setup: modal dismissals skipped -- a delivery holds this pane send lane')
       }
       setTimeout(() => {
         void (async () => {
-          try {
-            for (const cmd of identitySlashCommands(displayName)) {
-              runTmux(host, ['send-keys', '-t', session, cmd, 'Enter'], { timeout: 5000 })
-              await delay(1000)
+          // The /rename itself: retry-until-free rather than skip. The lane is
+          // re-acquired here (not held across the 5s render wait) so we never
+          // block a delivery while merely waiting.
+          for (let attempt = 1; attempt <= IDENTITY_LANE_MAX_ATTEMPTS; attempt++) {
+            const releaseIdentityLane = tryAcquireSessionSendLane(session, host)
+            if (!releaseIdentityLane) {
+              logger.info(
+                { session, displayName, attempt, max: IDENTITY_LANE_MAX_ATTEMPTS },
+                'Identity /rename deferred -- a delivery holds this pane send lane; retrying',
+              )
+              await delay(IDENTITY_LANE_RETRY_MS)
+              continue
             }
-            logger.info({ session, displayName }, 'Set session /name')
-          } catch (err) {
-            logger.warn({ err, session, displayName }, 'Failed to set session /name')
+            try {
+              for (const cmd of identitySlashCommands(displayName)) {
+                runTmux(host, ['send-keys', '-t', session, cmd, 'Enter'], { timeout: 5000 })
+                await delay(1000)
+              }
+              logger.info({ session, displayName, attempt }, 'Set session /rename')
+            } catch (err) {
+              logger.warn({ err, session, displayName }, 'Failed to set session /rename')
+            } finally {
+              releaseIdentityLane()
+            }
+            return
           }
+          // Gave up: the display name stays default. Cosmetic, and strictly
+          // better than splicing `/rename` into someone else's message. Logged
+          // loudly because a skip nobody logs is not a skip.
+          logger.warn(
+            { session, displayName, max: IDENTITY_LANE_MAX_ATTEMPTS },
+            'Identity /rename abandoned -- pane send lane stayed busy; session keeps its default name',
+          )
         })()
       }, IDENTITY_SEND_DELAY_MS)
     })()
@@ -1794,18 +2446,43 @@ export async function waitForPaneIdle(
 // instead of replacing it, which is how a box accumulates tick after tick until
 // nothing can be submitted at all. Keys are sent by name (no `-l` literal flag)
 // so tmux interprets them as control sequences.
-export async function clearInputBuffer(session: string, host: string | null = null): Promise<void> {
-  try {
-    const pane = capturePane(session, host)
-    for (const key of parkedClearSequence(pane != null ? parkedInputRowCount(pane) : 0)) {
-      runTmux(host, ['send-keys', '-t', session, key], { timeout: 5000 })
+// How many times the clear is attempted before we accept that the box will not
+// empty. Each pass re-reads the row count, so a partially-cleared multi-row
+// buffer gets a correctly-sized second sequence.
+const CLEAR_INPUT_MAX_ATTEMPTS = 3
+
+export async function clearInputBuffer(session: string, host: string | null = null): Promise<boolean> {
+  for (let attempt = 1; attempt <= CLEAR_INPUT_MAX_ATTEMPTS; attempt++) {
+    try {
+      const pane = capturePane(session, host)
+      for (const key of parkedClearSequence(pane != null ? parkedInputRowCount(pane) : 0)) {
+        runTmux(host, ['send-keys', '-t', session, key], { timeout: 5000 })
+      }
+      // Settle briefly so the next send-keys lands in the freshly cleared
+      // buffer rather than racing the clear.
+      await delay(100)
+    } catch (err) {
+      logger.warn({ err, session, attempt }, 'Failed to clear pane input buffer before send')
+      return false
     }
-    // Settle briefly so the next send-keys lands in the freshly cleared
-    // buffer rather than racing the clear.
-    await delay(100)
-  } catch (err) {
-    logger.warn({ err, session }, 'Failed to clear pane input buffer before send')
+    // VERIFY (2026-09-04 incident): the clear used to be fire-and-forget. On
+    // 09-03 the clear-scheduled path fired, left a truncated fragment of the
+    // parked tick behind, and that leftover no longer matched any delivery
+    // wrapper -- so every later restart decision read machineOrigin=false and
+    // deferred. The session sat wedged 25.4h. An unverified clear is the actual
+    // root cause; the restart hard cap only bounds the damage.
+    const after = capturePane(session, host)
+    if (after == null || stuckInputSignature(after) == null) return true
+    logger.warn(
+      { session, attempt, max: CLEAR_INPUT_MAX_ATTEMPTS },
+      'Input buffer still not empty after clear -- retrying',
+    )
   }
+  logger.error(
+    { session },
+    'Input buffer could not be emptied -- a leftover fragment stays parked (escalation will have to restart the pane)',
+  )
+  return false
 }
 
 // How many Ctrl-C presses the placeholder-discard will attempt before giving
@@ -1957,7 +2634,9 @@ export async function sendPromptToSession(
     logger.warn({ err, session }, 'Pre-send capture-pane failed; skipping truncated-preamble check')
   }
 
-  const oneLine = text.replace(/\r?\n/g, ' ')
+  // The mapping lives in pane-text.ts: the provenance gate re-applies it to
+  // the queue row, so the two must never drift (DIREKTIVASORTORES920).
+  const oneLine = paneOneLine(text)
   // STUCKINPUT827: remember the EXACT byte stream we are about to type. If the
   // submitting Enter does not land, the stuck-input watcher re-injects THIS
   // instead of guessing from a lossy screen scrape. Recorded before the send so
@@ -1990,6 +2669,15 @@ export async function sendPromptToSession(
       i = end
       if (i < oneLine.length) await delay(30)
     }
+    // A multi-chunk prompt gets its Enter only once the TUI has stopped
+    // redrawing. Sent straight after the last chunk, the Enter races the
+    // TUI still ingesting the burst and is dropped: measured 2026-09-15
+    // (SCHEDLOST915) on Claude Code 2.1.110, 80x24 pane, 6735-char scheduled
+    // prompt -- immediate Enter submitted 3/6 rounds, settle-then-Enter 6/6.
+    // The parked copy was invisible to the retry loop below (the box was
+    // taller than the pane, see overfullParkedInputTail), so nothing
+    // re-pressed it. Single-chunk prompts keep the immediate Enter.
+    if (oneLine.length > CHUNK) await waitForPaneSettle(() => capturePane(session, host))
     runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
   }
   await sendChunks()
@@ -2098,6 +2786,30 @@ export function sendEnterToSession(session: string, host: string | null = null):
 
 // Capture a pane snapshot with an execSync timeout. Null on any error so
 // the caller can treat "capture failed" as "not ready".
+// Resolve once two consecutive captures `pollMs` apart are identical (true), or
+// after `maxMs` of continuous change (false; the caller proceeds anyway, as it
+// did before this wait existed). A null capture never counts as settled.
+// Capture, sleep and clock are injectable so the loop is unit-tested without
+// tmux or real time.
+export async function waitForPaneSettle(
+  capture: () => string | null,
+  opts: { pollMs?: number; maxMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number } = {},
+): Promise<boolean> {
+  const pollMs = opts.pollMs ?? 250
+  const maxMs = opts.maxMs ?? 5000
+  const sleep = opts.sleep ?? delay
+  const now = opts.now ?? Date.now
+  const deadline = now() + maxMs
+  let prev = capture()
+  while (now() < deadline) {
+    await sleep(pollMs)
+    const cur = capture()
+    if (cur != null && cur === prev) return true
+    prev = cur
+  }
+  return false
+}
+
 export function capturePane(session: string, host: string | null = null): string | null {
   try {
     // Capture WITH colour, strip a trailing /rename session-title banner, then
@@ -2156,7 +2868,68 @@ export function captureParkedInputView(session: string, host: string | null = nu
 // dependency-free readiness check. NOTE the refusal is part of a deadlock by
 // design: Claude Code's auto-compact only runs when a new turn starts, and
 // this refusal is exactly what prevents a new turn -- so a saturated session
-// never self-heals and MUST be restarted from outside.
+// never self-heals and MUST be restarted from outside. The refusal therefore
+// applies ONLY while the banner is CREDIBLE -- see the override block below.
+
+// --- Saturation-banner override (context-guard -> dispatch) ----------------
+// The refusal above is safe only because the context-guard's saturation net
+// restarts the pane we will not prompt, so the two have to agree about what
+// "saturated" means. The guard's sweep is the only place that holds BOTH the
+// banner and the calibrated transcript measurement; when the measurement
+// contradicts an OVERRIDABLE (percentage-shaped) banner it stands the net down
+// and calls in here, because from that moment on refusing would silence a
+// working agent that nothing is going to restart. Which banners may be
+// overruled, and why an error-shaped one never may, is argued once -- on
+// saturationBannerCredible() in context-guard.ts.
+//
+// Deliberately in-process and TTL-bounded: the guard refreshes the entry on
+// every sweep, so if the guard stops (webOnly mode, guard disabled, crash,
+// dashboard restart) or the session genuinely fills up, the entry lapses within
+// ~3 sweeps and this gate returns to refusing. Fail-closed: an empty map (fresh
+// dashboard) is exactly today's behaviour.
+const saturationOverrideUntil = new Map<string, number>()
+
+/** Called by the context-guard runner when the measurement contradicts the
+ *  banner. */
+export function noteSaturationBannerUntrusted(session: string, untilMs: number): void {
+  saturationOverrideUntil.set(session, untilMs)
+}
+
+/** Called by the same runner on every sweep that LOOKED at the pane and found
+ *  the banner absent or credible. */
+export function clearSaturationBannerOverride(session: string): void {
+  saturationOverrideUntil.delete(session)
+}
+
+/** May we believe this session's pane saturation banner? Exported so the
+ *  fail-closed expiry is testable. */
+export function saturationBannerTrusted(session: string): boolean {
+  const until = saturationOverrideUntil.get(session)
+  if (until === undefined) return true
+  if (Date.now() >= until) {
+    saturationOverrideUntil.delete(session)
+    return true
+  }
+  return false
+}
+
+/** Does this capture refuse dispatch? The one question every injector asks.
+ *
+ *  The override above is keyed by SESSION, so it cannot know WHICH banner is on
+ *  screen -- which is exactly why the hard-error class is settled HERE, on the
+ *  capture itself, AHEAD of it. The reachable sequence this closes: a mis-tagged
+ *  agent's percentage banner is found not credible and an override entry is
+ *  written; the SAME agent later wedges for real and the CLI paints "Context
+ *  limit reached"; without this arm the still-valid entry would hold the gate
+ *  open and we would inject into a pane that cannot act -- one sweep at best,
+ *  the whole TTL at worst. Only a percentage claim is ever overridable; see
+ *  saturationBannerCredible() in context-guard.ts. */
+export function saturationRefusesDispatch(capture: string, session: string): boolean {
+  if (!paneShowsContextSaturation(capture)) return false
+  if (paneShowsContextSaturationHardError(capture)) return true
+  return saturationBannerTrusted(session)
+}
+
 export async function isSessionReadyForPrompt(session: string, host: string | null = null): Promise<boolean> {
   // Dim-ghost tolerant idle read: CC >=2.1.202 paints a dim placeholder into
   // the empty input box, which a plain capture reads as parked text. Only when
@@ -2167,7 +2940,7 @@ export async function isSessionReadyForPrompt(session: string, host: string | nu
     idleConsideringDimGhost(plain, detectPaneState(plain) === 'typing' ? captureParkedInputView(session, host) : null)
   const first = capturePane(session, host)
   if (first == null) return false
-  if (paneShowsContextSaturation(first)) {
+  if (saturationRefusesDispatch(first, session)) {
     logger.warn({ session }, 'dispatch: refusing prompt — session shows context saturation (100% context)')
     return false
   }
@@ -2177,7 +2950,7 @@ export async function isSessionReadyForPrompt(session: string, host: string | nu
 
   const second = capturePane(session, host)
   if (second == null) return false
-  if (paneShowsContextSaturation(second)) {
+  if (saturationRefusesDispatch(second, session)) {
     logger.warn({ session }, 'dispatch: refusing prompt — session shows context saturation (100% context)')
     return false
   }
@@ -2214,6 +2987,108 @@ const SUBAGENT_PARKED_ESCALATE_AFTER = 6  // ~3min for a sub-agent whose auto-cl
 // the first threshold, per the spec).
 export const MAIN_PARKED_HEARTBEAT_AFTER = 6
 export const MAIN_PARKED_OWNER_AFTER = 12
+// One more stage past the owner notification (~6 min at UNWEDGE_COOLDOWN_MS),
+// so the operator has had a full stage with the manual fix in hand before the
+// box is rescued and cleared for them. GH #890.
+export const MAIN_PARKED_RESCUE_AFTER = 24
+
+// Where a rescued parked line is written before the box is cleared.
+export const PARKED_RESCUE_DIR = join(STORE_DIR, 'parked-input')
+
+// The rescued text is whatever the owner had typed. It is not a secret by
+// design, but it is private by accident, and the rest of store/ already treats
+// per-install state that way: .dashboard-token, claudeclaw.db and
+// .claude-oauth-token are all 0600 (measured). Matching that is not about
+// today's threat model -- we run as one OS user and we know it -- it is that a
+// file sitting at 0644 next to three at 0600 later reads as a deliberate
+// exception, and nobody remembers that it was not.
+const RESCUE_FILE_MODE = 0o600
+const RESCUE_DIR_MODE = 0o700
+
+// How many rescues to keep. Every rescue is a new file and nothing removed them,
+// so the directory only grew. This is a rare event, so a scheduled sweep would
+// be machinery for a handful of files a year; pruning at write time costs one
+// readdir on an event that already does disk I/O, and cannot drift out of sync
+// with the writer because it IS the writer.
+const RESCUE_KEEP_FILES = 50
+const RESCUE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * Drop rescues that are older than RESCUE_MAX_AGE_MS, and any beyond the newest
+ * RESCUE_KEEP_FILES. Best effort by design: a failure to prune must never stop
+ * a rescue from being written, because the rescue is what protects the text.
+ */
+function pruneRescueDir(nowMs: number): void {
+  try {
+    const entries = readdirSync(PARKED_RESCUE_DIR)
+      .filter((f) => f.endsWith('.txt'))
+      .map((f) => {
+        const full = join(PARKED_RESCUE_DIR, f)
+        return { full, mtimeMs: statSync(full).mtimeMs }
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    for (const [i, e] of entries.entries()) {
+      if (i >= RESCUE_KEEP_FILES || nowMs - e.mtimeMs > RESCUE_MAX_AGE_MS) {
+        rmSync(e.full, { force: true })
+      }
+    }
+  } catch { /* pruning is best effort: never block a rescue */ }
+}
+
+/**
+ * Write the parked text to disk and READ IT BACK before reporting success.
+ *
+ * The read-back is the whole point, not diligence theatre. Clearing an input box
+ * destroys the only copy of whatever was in it; a save whose success nobody
+ * checked is indistinguishable from no save at all, and it would turn this
+ * function into a delete with extra steps. Returns the path only when the file
+ * exists and its content matches what we meant to store; on any failure the
+ * caller must leave the box alone.
+ *
+ * The saved text is a SCRAPE of the VISIBLE box, and that limit is written into
+ * the file itself: an overfull box drops its head rows in the TUI, so the rescue
+ * can be a tail fragment. Better a labelled fragment on disk than a silent
+ * total loss, but the label has to travel with it or the next reader will treat
+ * a fragment as the whole message.
+ */
+export function rescueParkedInput(
+  session: string,
+  text: string,
+  nowMs: number = Date.now(),
+): string | null {
+  try {
+    mkdirSync(PARKED_RESCUE_DIR, { recursive: true, mode: RESCUE_DIR_MODE })
+    // mkdirSync's mode only applies when it CREATES the directory. An install
+    // that already ran the first version of this rescue has the directory at
+    // the default 0755, and would silently keep it. Tighten it explicitly.
+    try { chmodSync(PARKED_RESCUE_DIR, RESCUE_DIR_MODE) } catch { /* best effort */ }
+    const stamp = new Date(nowMs).toISOString().replace(/[:.]/g, '-')
+    const safeSession = session.replace(/[^A-Za-z0-9._-]/g, '_')
+    const path = join(PARKED_RESCUE_DIR, `${safeSession}-${stamp}.txt`)
+    const body =
+      `# Parked input rescued before the box was cleared\n` +
+      `# session: ${session}\n` +
+      `# saved:   ${new Date(nowMs).toISOString()}\n` +
+      `# NOTE: this is a scrape of the VISIBLE input box. An overfull box drops\n` +
+      `#       its head rows in the TUI, so this may be the tail of a longer line.\n` +
+      `\n${text}\n`
+    writeFileSync(path, body, { encoding: 'utf-8', mode: RESCUE_FILE_MODE })
+    // Read back: the file has to exist AND hold what we wrote. A partial write,
+    // a full disk or a read-only store all land here rather than in a clear.
+    const readBack = readFileSync(path, 'utf-8')
+    if (!readBack.includes(text)) {
+      logger.error({ session, path }, 'parked-input rescue: read-back did not match, refusing to clear the box')
+      return null
+    }
+    // Only after the rescue is safely on disk: a prune that threw would
+    // otherwise take the rescue down with it.
+    pruneRescueDir(nowMs)
+    return path
+  } catch (err) {
+    logger.error({ session, err }, 'parked-input rescue: save failed, refusing to clear the box')
+    return null
+  }
+}
 
 // Pure decision, exported for tests: which escalation stage applies. 'owner'
 // fires once per episode (ownerNotified latches via the record's escalated
@@ -2221,7 +3096,22 @@ export const MAIN_PARKED_OWNER_AFTER = 12
 export function decideMainParkedEscalation(
   fails: number,
   ownerNotified: boolean,
-): 'none' | 'heartbeat' | 'owner' {
+): 'none' | 'heartbeat' | 'owner' | 'rescue-and-clear' {
+  // GH #890: past the owner-notify stage the box has held the SAME text for
+  // roughly MAIN_PARKED_RESCUE_AFTER cooldown rounds, and every scheduled task
+  // in the meantime has been deferred -- the reporter's symptom, and measured
+  // again on 2026-09-09 as 22 skipped tasks in one hour. Leaving it parked is
+  // not neutral: it is a silent, open-ended stall of the whole scheduler.
+  //
+  // Clearing it is only acceptable because the text is rescued to disk and the
+  // save is read back FIRST (rescueParkedInput). That is what separates this
+  // from the move rejected in GH #717: submitting an operator's half-typed line
+  // is irreversible, clearing a line whose verified copy sits in store/ is not.
+  //
+  // The threshold sits AFTER the owner notification on purpose. The operator has
+  // already been told, with the manual fix, and has had a full stage to act. A
+  // human composing a message for two minutes is never in this branch.
+  if (fails >= MAIN_PARKED_RESCUE_AFTER) return 'rescue-and-clear'
   if (fails >= MAIN_PARKED_OWNER_AFTER && !ownerNotified) return 'owner'
   if (fails >= MAIN_PARKED_HEARTBEAT_AFTER) return 'heartbeat'
   return 'none'
@@ -2258,7 +3148,23 @@ const unwedgeAttempts = new Map<string, { last: number; sig: string; fails: numb
 // parked text -- never 'busy'/processing) AND the text is unchanged across a
 // short settle, so input a human or agent is actively typing is never clobbered.
 // Returns true if it cleared something (caller should retry delivery next tick).
-export async function clearStaleParkedInput(session: string, host: string | null = null): Promise<boolean> {
+//
+// PANEWRITERS910: the settle-confirm and the clearing keystrokes run under the
+// per-pane send lane, fail-closed. The callers (message-router janitor and the
+// schedule-runner's two janitor sites) tick on independent timers, so without
+// the lane the Ctrl-U/C-k sequence could fire into a pane holding a delivery's
+// half-typed message -- a chunked send pausing past the 2s stability window
+// reads exactly like a stale parked line (same defect class as IDENTLANE910).
+// A busy lane returns false: if a delivery owns the pane, the "parked" text is
+// in-transit, not stale. lockMode 'held' is for the ONE caller already inside
+// the lane (schedule-runner's reinject path, which runs in its delivery's
+// withSessionSendLock span) -- acquiring again there would self-deadlock into
+// a false skip.
+export async function clearStaleParkedInput(
+  session: string,
+  host: string | null = null,
+  opts: { lockMode?: 'acquire' | 'held' } = {},
+): Promise<boolean> {
   const a = capturePane(session, host)
   if (a == null || detectPaneState(a) !== 'typing') return false
   // DIM-GUARD (2026-06-30, Szabi insight): extract the parked TEXT from the
@@ -2282,6 +3188,33 @@ export async function clearStaleParkedInput(session: string, host: string | null
   const prev = unwedgeAttempts.get(key)
   if (prev && prev.sig === parked && nowMs - prev.last < UNWEDGE_COOLDOWN_MS) return false
 
+  if ((opts.lockMode ?? 'acquire') === 'held') {
+    return clearStaleParkedInputInLane(session, host, a, parked, key, nowMs, prev)
+  }
+  const releaseLane = tryAcquireSessionSendLane(session, host)
+  if (!releaseLane) {
+    logger.info({ session }, 'stale-parked-input janitor skipped -- a delivery holds this pane send lane (the box likely holds in-transit text, not a wedge)')
+    return false
+  }
+  try {
+    return await clearStaleParkedInputInLane(session, host, a, parked, key, nowMs, prev)
+  } finally {
+    releaseLane()
+  }
+}
+
+// The lane-holding tail of clearStaleParkedInput: stability confirm, main-agent
+// escalation bookkeeping, and the clearing keystrokes. Split out so the lane
+// release lives in ONE finally regardless of which of the many exits runs.
+async function clearStaleParkedInputInLane(
+  session: string,
+  host: string | null,
+  a: string,
+  parked: string,
+  key: string,
+  nowMs: number,
+  prev: { last: number; sig: string; fails: number; escalated: boolean } | undefined,
+): Promise<boolean> {
   await delay(PARKED_STABLE_CONFIRM_MS)
   const b = capturePane(session, host)
   // Changed (someone is typing) or already cleared -> leave it alone, and do not
@@ -2323,11 +3256,38 @@ export async function clearStaleParkedInput(session: string, host: string | null
       logger.warn({ session, parked: parked.slice(0, 60), fails }, 'message-router: main-agent parked input -- owner notified with manual fix (box untouched)')
     } else if (stage === 'heartbeat') {
       logger.warn({ session, parked: parked.slice(0, 60), fails }, 'message-router: main-agent parked input -- persisting; visible to the heartbeat round (box untouched)')
-    } else {
+    } else if (stage !== 'rescue-and-clear') {
       logger.debug({ session, parked: parked.slice(0, 60), fails }, 'message-router: main-agent parked input -- left untouched')
     }
-    unwedgeAttempts.set(key, { last: nowMs, sig: parked, fails, escalated })
-    return false
+
+    // GH #890: the box has held the same text past the owner-notify stage and
+    // is stalling every scheduled task behind it. Rescue the line to disk, and
+    // clear ONLY if that save read back intact. If the save fails we keep the
+    // old behaviour exactly -- untouched box, escalation record, no keystroke.
+    if (stage === 'rescue-and-clear') {
+      const rescuedPath = rescueParkedInput(session, parked, nowMs)
+      if (rescuedPath == null) {
+        logger.warn(
+          { session, parked: parked.slice(0, 60), fails },
+          'message-router: main-agent parked input -- rescue save failed, box left untouched (a clear without a verified copy is a delete)',
+        )
+        unwedgeAttempts.set(key, { last: nowMs, sig: parked, fails, escalated })
+        return false
+      }
+      notifyChannel(
+        `🧹 A fo agens (${session}) input-mezojeben ~${Math.round((fails * UNWEDGE_COOLDOWN_MS) / 60000)} perce allt egy parkolt sor, ` +
+        `es emiatt minden utemezett feladat varakozott. A sort KIMENTETTUK es a mezot kitisztitottuk, ` +
+        `hogy a csatorna ujra dolgozzon. A szoveg itt van: ${rescuedPath}`,
+      ).catch(() => { /* notify is best-effort */ })
+      logger.warn(
+        { session, parked: parked.slice(0, 60), fails, rescuedPath },
+        'message-router: main-agent parked input rescued to disk, clearing the box',
+      )
+      // Fall through to the shared clear sequence below.
+    } else {
+      unwedgeAttempts.set(key, { last: nowMs, sig: parked, fails, escalated })
+      return false
+    }
   }
 
   // Forward deletion, budgeted by the visible row count -- see the rationale and

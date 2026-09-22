@@ -10,8 +10,9 @@
 // Two-tier allowlist:
 //   1. Built-in (ALLOWED_PREFIXES): hard-coded, always enforced.
 //   2. Runtime (store/egress-allowlist.json): operator-managed, loaded on each
-//      invocation. Shape: { "domains": ["example.com"], "prefixes": ["https://host/path/"] }
-//      Both keys are optional. Missing file or malformed JSON -> treated as empty
+//      invocation. Shape: { "domains": ["example.com"], "prefixes": ["https://host/path/"],
+//      "quarantine_domains": ["feeds.example.org"], "quarantine_reader_posture": "allowlist"|"denylist" }
+//      All keys are optional. Missing file or malformed JSON -> treated as empty
 //      lists (FAIL-OPEN on the file, FAIL-SAFE on the decision: the built-in list
 //      still guards; no extra URLs are allowed merely because the file is missing).
 //
@@ -32,10 +33,17 @@
 // The log is separate from the main Marveen log so operators can grep it
 // independently: `tail -f store/egress-blocked.log`
 //
-// Scope: this guard covers the Claude Code WebFetch tool only. It does NOT
-// intercept WebSearch, curl/Bash network calls, or MCP-server outbound
-// requests. Those channels are out of scope for this hook mechanism and require
-// separate controls if needed.
+// Scope: this guard covers the Claude Code WebFetch tool only -- it is wired
+// with matcher "WebFetch" and sees no other tool. It does NOT intercept
+// WebSearch or MCP-server outbound requests.
+//
+// The SHELL half is a separate control: BASH_EGRESS_DENY in
+// src/web/agent-scaffold.ts puts a small permissions.deny list on every agent
+// (curl to https://, plus wget/nc/ncat/telnet outright), because a fetched page
+// telling an agent to run a curl would otherwise walk straight past this file.
+// That list is a deny list, not a sandbox, and its limits are written down in
+// docs/security-hardening.md. The two halves are deliberately separate: this
+// one decides on a URL, that one on a command string.
 
 import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import { realpathSync } from 'node:fs'
@@ -132,6 +140,99 @@ const QUARANTINE_DOMAINS = [
   { domain: 'www.reddit.com', path: (p) => p.endsWith('.rss') },
 ]
 
+// The reader's posture is an OPERATOR SWITCH, not a code-level decision.
+//
+// First proposed as an unconditional inversion (allowlist -> denylist); the
+// upstream owner asked for both behaviours to coexist behind one setting, with
+// the allowlist as the default, and his reasoning is recorded here because it
+// is the contract this code keeps: the two failure directions are not
+// symmetric. An allowlist that errs refuses a legitimate read, and a human
+// hears about it. A denylist that errs lets something in, and nobody hears
+// anything. A default that silently flips on update pushes every install
+// toward the quieter failure without anyone having decided that -- so the
+// flip must be an explicit, per-install operator act:
+//
+//   store/egress-allowlist.json: { "quarantine_reader_posture": "denylist" }
+//
+// Anything other than the literal string "denylist" (missing key, missing
+// file, typo, wrong type) means "allowlist" -- the stricter, louder default.
+// An untouched install behaves byte-identically to before this change.
+//
+// Why the open posture is defensible for THIS tier and no other: the posture
+// applies only to the quarantine-reader, a sub-agent whose definition grants
+// it `tools: WebFetch` and nothing else. No shell, no filesystem, no store
+// access -- it holds nothing to leak, and what it returns is data the caller
+// must wrap before use. The main agent's own WebFetch path is unaffected by
+// the switch in either position.
+//
+// What the deny rules below must stop in the open posture is therefore NOT
+// exfiltration but SSRF: a poisoned page talking the caller into aiming the
+// reader at our own network. Hence literal internal hosts, internal-only name
+// suffixes, and private/link-local/loopback address literals.
+const QUARANTINE_DENY_HOSTS = new Set([
+  'localhost',
+  'localhost.localdomain',
+  'broadcasthost',
+  '0.0.0.0',
+  '::',
+  '::1',
+  '[::]',
+  '[::1]',
+  'metadata.google.internal',
+  'instance-data',
+])
+
+const QUARANTINE_DENY_SUFFIXES = ['.localhost', '.local', '.internal', '.home.arpa', '.lan']
+
+// Private / link-local / loopback IPv4 literals, plus the cloud metadata
+// address (169.254.169.254 is inside the link-local range and thus covered).
+function isPrivateIPv4(host) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  if (!m) return false
+  const [a, b] = [Number(m[1]), Number(m[2])]
+  if (m.slice(1).some((x) => Number(x) > 255)) return true // malformed -> deny
+  if (a === 10 || a === 127 || a === 0) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
+  if (a === 169 && b === 254) return true
+  if (a === 100 && b >= 64 && b <= 127) return true // CGNAT
+  return false
+}
+
+// IPv6 loopback / unique-local / link-local, with or without brackets.
+function isPrivateIPv6(host) {
+  const h = host.replace(/^\[|\]$/g, '').toLowerCase()
+  if (!h.includes(':')) return false
+  if (h === '::1' || h === '::') return true
+  if (h.startsWith('fc') || h.startsWith('fd')) return true // unique-local
+  if (h.startsWith('fe80')) return true // link-local
+  // IPv4-mapped (::ffff:10.0.0.1) -- reuse the v4 rules on the tail.
+  const tail = h.split(':').pop() ?? ''
+  if (tail.includes('.')) return isPrivateIPv4(tail)
+  return false
+}
+
+// KNOWN LIMIT, stated rather than papered over: this checks the hostname as
+// written. A public name that RESOLVES to a private address (DNS rebinding)
+// still passes, because the hook sees the URL, not the socket. Closing that
+// needs resolution at fetch time, which is not this layer's job.
+export function isQuarantineDenied(url) {
+  let parsed
+  try {
+    parsed = new URL(url)
+  } catch {
+    return true // unparseable -> deny
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return true
+  const host = parsed.hostname.toLowerCase()
+  if (!host) return true
+  if (QUARANTINE_DENY_HOSTS.has(host)) return true
+  if (QUARANTINE_DENY_SUFFIXES.some((s) => host.endsWith(s))) return true
+  if (isPrivateIPv4(host)) return true
+  if (isPrivateIPv6(host)) return true
+  return false
+}
+
 function matchesQuarantineDomain(url, extraDomains = []) {
   let parsed
   try {
@@ -151,234 +252,6 @@ function matchesQuarantineDomain(url, extraDomains = []) {
   return extraDomains.some(hostMatches)
 }
 
-// OPEN QUARANTINE MODE (operator decision, 2026-09-18).
-//
-// With `"quarantine_open": true` in store/egress-allowlist.json the
-// quarantine-reader may fetch ANY public host instead of a curated list. The
-// owner's reasoning: every request so far was approved anyway, and the
-// per-domain round trip stalled research mid-task. What the tier still
-// protects is unchanged and is the part that matters: fetched content comes
-// back as DATA through the reader, never as instructions in an agent's
-// context, and the MAIN agent's own WebFetch stays on the curated list.
-//
-// Open mode is NOT open to everything. Three classes stay blocked, because
-// they are the ways an open fetch turns into an outbound channel or an
-// internal probe:
-//   1. Non-public hosts: loopback, RFC1918, link-local (169.254.169.254 is the
-//      cloud metadata endpoint), internal TLDs, and wildcard-DNS names that
-//      encode an inward address (127.0.0.1.nip.io).
-//   2. Exfiltration sinks: paste services, request bins and webhook catchers,
-//      URL shorteners, anonymous file drops, bot APIs. A GET to one of these
-//      carries whatever is in the URL out of the house.
-//   3. Non-http(s) schemes and non-standard ports.
-// The denylist is baked in here, not only in the JSON, so an operator editing
-// the file cannot lose it by accident; `quarantine_denylist` in the JSON adds
-// to it and never subtracts.
-const OPEN_MODE_DENY = [
-  // paste / text drops
-  'pastebin.com', 'paste.ee', 'hastebin.com', 'ghostbin.com', 'termbin.com', '0x0.st', 'dpaste.org', 'rentry.co',
-  // request bins, webhook catchers, tunnels
-  'webhook.site', 'requestbin.com', 'pipedream.net', 'requestcatcher.com', 'beeceptor.com',
-  'ngrok.io', 'ngrok-free.app', 'loca.lt', 'serveo.net', 'trycloudflare.com',
-  // url shorteners (a shortener hides the real destination from this gate)
-  'bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'is.gd', 'cutt.ly', 'rb.gy', 'shorturl.at',
-  // anonymous file drops
-  'transfer.sh', 'file.io', 'anonfiles.com', 'gofile.io', 'catbox.moe', 'tmpfiles.org',
-  // bot / message APIs and form endpoints: a plain GET posts a message or a row
-  'api.telegram.org', 'discord.com', 'discordapp.com', 'discord.gg', 'slack.com',
-  'script.google.com', 'docs.google.com', 'forms.gle', 'google-analytics.com', 'analytics.google.com',
-  // more request bins and tunnels (Argus F1)
-  'smee.io', 'postb.in', 'typedwebhook.tools', 'ngrok.app', 'ngrok.dev', 'localtunnel.me',
-  // wildcard-DNS services: the name check covers the encoded forms, this covers the rest
-  'nip.io', 'sslip.io', 'traefik.me', 'localtest.me', 'lvh.me', 'vcap.me',
-]
-
-// The denylist NAMES a set; open mode faces an unbounded one. Argus F1 says it
-// plainly and it belongs here, not in a review file: in open mode ANY
-// attacker-owned public host is an exfiltration channel, so this list buys
-// hygiene against the obvious sinks, not a guarantee. The guarantee comes from
-// the reader's isolation (content is data) and from the audit log.
-
-// Host shape check, mirroring isPublicFetchHost() in src/web/agent-scaffold.ts.
-// Duplicated on purpose: this hook is a standalone .mjs with no import path
-// into the TypeScript build, and a gate that depends on a build artifact is a
-// gate that can be missing. When the two disagree, THIS one decides.
-// Is this IPv4 (as four numbers) one we must never reach from the reader?
-// Loopback, "this network", RFC1918, CGNAT, link-local (169.254.169.254 is the
-// cloud metadata endpoint), and the IPv4 broadcast.
-export function isInwardIPv4(a, b, c, d) {
-  const n = [a, b, c, d].map((x) => Number(x))
-  if (n.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false
-  if (n[0] === 127 || n[0] === 10 || n[0] === 0) return true
-  if (n[0] === 192 && n[1] === 168) return true
-  if (n[0] === 169 && n[1] === 254) return true
-  if (n[0] === 172 && n[1] >= 16 && n[1] <= 31) return true
-  if (n[0] === 100 && n[1] >= 64 && n[1] <= 127) return true   // CGNAT (Argus F4)
-  if (n[0] === 255 && n[1] === 255 && n[2] === 255 && n[3] === 255) return true
-  return false
-}
-
-// ONE normaliser, used by every open-mode check (Argus UB1, 2026-09-18).
-// The first version normalised in the SHAPE check and compared the RAW hostname
-// against the denylist, so "pastebin.com." passed both: the shape check saw
-// "pastebin.com" (public, fine) and the denylist saw a string that matched no
-// entry. Six sinks went from BLOCK to ALLOW, with an ALLOWED line in the log.
-// The lesson is the rule now: normalise once, at the edge, and let every check
-// downstream see the same string.
-export function normalizeHost(hostname) {
-  return String(hostname ?? '').trim().toLowerCase().replace(/\.+$/, '')
-}
-
-// A DNS LABEL can encode an address in more ways than the dotted quad.
-// Measured by Argus on 2026-09-18, every one of these resolved inward while the
-// first version of this check said "public": 7f000001.nip.io -> 127.0.0.1,
-// a9fea9fe.nip.io -> 169.254.169.254 (the metadata endpoint the comment above
-// names), app-127-0-0-1.nip.io -> 127.0.0.1, 100-64-0-1.nip.io -> CGNAT.
-// So: 8 hex digits is a 32-bit address; a dashed quad counts even as a
-// SUBSTRING of a longer label; a long run of digits is a decimal address.
-export function labelEncodesInwardAddress(label) {
-  const l = String(label ?? '').toLowerCase()
-  if (!l) return false
-  // 8 hex digits as a DASH-DELIMITED piece of the label: 7f000001,
-  // app-7f000001, 7f000001-app. Not embedded in a longer run of hex, because
-  // Argus measured what the wildcard-DNS services actually serve:
-  // deadbeef7f000001.nip.io is NXDOMAIN, while app-7f000001.nip.io resolves to
-  // 127.0.0.1. Scanning every overlapping window blocked 27% of random 32-char
-  // hex labels -- CDN names like dqwjwmk7f000001.cloudfront.net -- for a form
-  // that cannot resolve inward anyway. An over-block here would look like a
-  // random network error, and nobody would come looking in this file for it.
-  for (const m of l.matchAll(/(?:^|-)([0-9a-f]{8})(?=-|$)/g)) {
-    const v = parseInt(m[1], 16)
-    if (Number.isInteger(v) && isInwardIPv4((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255)) return true
-  }
-  // Dashed quad anywhere, OVERLAPPING: in "1-2-127-0-0-1" a non-overlapping
-  // scan eats the digits as 1-2-127-0 and never sees 127-0-0-1.
-  const nums = [...l.matchAll(/\d{1,3}/g)]
-  for (let i = 0; i + 3 < nums.length; i++) {
-    const [a, b, c, d] = nums.slice(i, i + 4).map((m) => m[0])
-    // only count it when the four numbers are actually dash-joined
-    const from = nums[i].index ?? 0
-    const to = (nums[i + 3].index ?? 0) + nums[i + 3][0].length
-    if (!/^[\d-]+$/.test(l.slice(from, to))) continue
-    if (isInwardIPv4(a, b, c, d)) return true
-  }
-  // decimal 32-bit form: 2130706433 == 127.0.0.1. A LEADING ZERO is excluded on
-  // purpose: "08080808" is the hex form of 8.8.8.8 (public), and reading it as
-  // decimal 8080808 turns it into 0.123.71.104, which the inward check calls
-  // private -- a false block on an ordinary-looking label. A real decimal
-  // encoding never carries a leading zero. (Caught by the test above.)
-  if (/^[1-9]\d{7,9}$/.test(l)) {
-    const v = Number(l)
-    if (Number.isInteger(v) && v >= 0 && v <= 4294967295) {
-      if (isInwardIPv4((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255)) return true
-    }
-  }
-  return false
-}
-
-// Host SHAPE check. It rejects what a name reveals about itself; what a name
-// RESOLVES to is a separate question, answered by resolvesInward() below --
-// this one cannot see an A record pointing at 127.0.0.1 (Argus B2).
-export function isPublicOpenHost(hostname) {
-  const host = normalizeHost(hostname)
-  if (!host || host.length > 253) return false
-  if (host.startsWith('[') || host.includes(':')) return false   // IPv6 literal / userinfo leftovers
-  if (/[^a-z0-9.-]/.test(host)) return false
-  if (host.startsWith('.')) return false
-  if (/^\d+$/.test(host)) return false                            // decimal IPv4 literal (2130706433)
-  if (/^0x[0-9a-f]+$/.test(host)) return false                    // hex IPv4 literal
-  if (/^\d+(\.\d+)*$/.test(host)) return false                    // dotted or octal IPv4 literal
-  const labels = host.split('.')
-  if (labels.length < 2) return false                             // single label: localhost and friends
-  if (labels.some((l) => !l || l.length > 63 || l.startsWith('-') || l.endsWith('-'))) return false
-  const INTERNAL_SUFFIX = ['local', 'internal', 'localdomain', 'lan', 'intranet', 'home', 'arpa', 'test',
-    'invalid', 'localhost', 'svc', 'cluster', 'corp', 'priv', 'private', 'domain']
-  if (INTERNAL_SUFFIX.includes(labels[labels.length - 1])) return false
-  // Wildcard-DNS services encode the address in the NAME: nip.io, sslip.io,
-  // traefik.me and any clone. Checking the encoding beats listing the services.
-  if (labels.some((l) => labelEncodesInwardAddress(l))) return false
-  for (let i = 0; i + 3 < labels.length; i++) {
-    if (isInwardIPv4(labels[i], labels[i + 1], labels[i + 2], labels[i + 3])) return false
-  }
-  return true
-}
-
-// Does this name RESOLVE inward? (Argus B2: the shape check reads the name, and
-// localtest.me / lvh.me / any attacker-owned domain can simply have an A record
-// of 127.0.0.1 or 169.254.169.254. A name list cannot close that class; the
-// list is infinite.)
-//
-// RESIDUAL RISK, stated rather than hidden: this resolves at GATE time and the
-// fetch resolves again, so a DNS rebind between the two is not covered. It
-// raises the bar from "type a name" to "run a rebinding server", and the fetch
-// still lands in the reader, whose output is data, never instructions.
-//
-// FAIL-CLOSED on lookup failure: an unresolvable host is refused. A blocked
-// legitimate fetch is visible and retryable; an allowed inward one is not.
-export async function resolvesInward(hostname) {
-  const { lookup } = await import('node:dns/promises')
-  let addrs
-  try {
-    addrs = await lookup(normalizeHost(hostname), { all: true, verbatim: true })
-  } catch {
-    return { inward: true, reason: 'dns lookup failed' }
-  }
-  for (const { address, family } of addrs) {
-    if (family === 4) {
-      const p = String(address).split('.')
-      if (isInwardIPv4(p[0], p[1], p[2], p[3])) return { inward: true, reason: `resolves inward (${address})` }
-    } else {
-      const a = String(address).toLowerCase()
-      // IPv4-mapped (::ffff:127.0.0.1) carries the v4 rules with it.
-      const mapped = /^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(a)
-      if (mapped && isInwardIPv4(mapped[1], mapped[2], mapped[3], mapped[4])) {
-        return { inward: true, reason: `resolves inward (${address})` }
-      }
-      // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) embed an IPv4 address; the
-      // embedded one may be inward even though the outer form looks global.
-      const embedded = /^(?:64:ff9b::|2002:)([0-9a-f]{1,4}):([0-9a-f]{1,4})/.exec(a)
-      if (embedded) {
-        const hi = parseInt(embedded[1], 16), lo = parseInt(embedded[2], 16)
-        if (isInwardIPv4((hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255)) {
-          return { inward: true, reason: `resolves inward (${address})` }
-        }
-      }
-      if (a === '::1' || a === '::' || a.startsWith('fe80:') || a.startsWith('fc') || a.startsWith('fd')) {
-        return { inward: true, reason: `resolves inward (${address})` }
-      }
-    }
-  }
-  return { inward: false, reason: '' }
-}
-
-// Open-mode verdict for one URL. Exported so the tests can drive it directly.
-// Returns { allowed: boolean, reason: string }.
-export function openModeDecision(url, extraDeny = []) {
-  let parsed
-  try {
-    parsed = new URL(String(url ?? ''))
-  } catch {
-    return { allowed: false, reason: 'unparseable url' }
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return { allowed: false, reason: 'scheme not http(s)' }
-  }
-  if (parsed.port && parsed.port !== '80' && parsed.port !== '443') {
-    return { allowed: false, reason: 'non-standard port' }
-  }
-  const host = normalizeHost(parsed.hostname)
-  if (!isPublicOpenHost(host)) return { allowed: false, reason: 'host not public' }
-  const deny = [...OPEN_MODE_DENY, ...extraDeny.filter((d) => typeof d === 'string')]
-  for (const d of deny) {
-    const entry = d.trim().toLowerCase()
-    if (!entry) continue
-    if (host === entry || host.endsWith('.' + entry)) {
-      return { allowed: false, reason: `denylisted host (${entry})` }
-    }
-  }
-  return { allowed: true, reason: 'open quarantine tier' }
-}
-
 // Load the runtime allowlist from store/egress-allowlist.json.
 // FAIL-OPEN on the file: missing or malformed -> empty lists, NOT an error.
 // The caller must still apply the built-in ALLOWED_PREFIXES.
@@ -395,17 +268,14 @@ export function loadRuntimeAllowlist() {
       quarantineDomains: Array.isArray(parsed.quarantine_domains)
         ? parsed.quarantine_domains.filter((d) => typeof d === 'string')
         : [],
-      // Open quarantine mode: any public host for the reader tier. Strictly
-      // boolean true -- a string "true", a 1 or a missing key all mean OFF, so
-      // a typo in the file cannot silently open the tier.
-      quarantineOpen: parsed.quarantine_open === true,
-      quarantineDenylist: Array.isArray(parsed.quarantine_denylist)
-        ? parsed.quarantine_denylist.filter((d) => typeof d === 'string')
-        : [],
+      // The reader-posture switch. ONLY the literal string "denylist" opens
+      // the reader; any other value -- absent key, typo, wrong type -- is the
+      // allowlist default. Fail-closed to the louder failure direction.
+      quarantinePosture: parsed.quarantine_reader_posture === 'denylist' ? 'denylist' : 'allowlist',
     }
   } catch {
     // Missing file or JSON parse error: treat as empty, never propagate.
-    return { domains: [], prefixes: [], quarantineDomains: [], quarantineOpen: false, quarantineDenylist: [] }
+    return { domains: [], prefixes: [], quarantineDomains: [], quarantinePosture: 'allowlist' }
   }
 }
 
@@ -426,23 +296,27 @@ export function loadRuntimeAllowlist() {
 export function egressDecision(
   toolName,
   toolInput,
-  runtimeList = { domains: [], prefixes: [], quarantineDomains: [], quarantineOpen: false, quarantineDenylist: [] },
+  runtimeList = { domains: [], prefixes: [], quarantineDomains: [] },
   agentType = '',
 ) {
   if (toolName !== 'WebFetch') return { blocked: false, tier: 'not-webfetch' }
   const url = String(toolInput?.url ?? '')
   if (!url) return { blocked: false, tier: 'no-url' }
 
-  // OPEN-MODE DENYLIST RUNS FIRST, for the reader only (measured 2026-09-18
-  // while testing this change): the built-in prefixes are checked before the
-  // quarantine tier, and two of them -- api.telegram.org and the local
-  // dashboard -- are exactly the shape the denylist exists to stop (a GET that
-  // sends a message, a GET that reads local state). Without this pre-check the
-  // denylist would silently NOT cover them. The main agent is unaffected: it
-  // needs both, and its content path is a different question.
-  if (String(agentType ?? '') === QUARANTINE_AGENT_TYPE && runtimeList.quarantineOpen === true) {
-    const pre = openModeDecision(url, runtimeList.quarantineDenylist ?? [])
-    if (!pre.allowed) return { blocked: true, tier: 'quarantine-open-deny', reason: pre.reason }
+  const openReader = String(agentType ?? '') === QUARANTINE_AGENT_TYPE
+    && (runtimeList.quarantinePosture ?? 'allowlist') === 'denylist'
+
+  // 0. Reader deny rules, BEFORE every allow path -- in the denylist posture
+  //    only, so the default posture stays byte-identical to the pre-switch
+  //    gate. Order matters and was found by a test, not by reading: the
+  //    built-in prefixes include this install's own dashboard
+  //    (http://localhost:PORT/), so with the deny rules consulted only in
+  //    step 4 an open reader would have reached localhost through step 1 --
+  //    the one address the deny rules exist to refuse. An allowlist that
+  //    predates the switch must not be able to re-open what the open posture
+  //    walls off.
+  if (openReader && isQuarantineDenied(url)) {
+    return { blocked: true, tier: 'quarantine-denied' }
   }
 
   // 1. Built-in prefix check (startsWith is correct here: the prefix already
@@ -473,17 +347,22 @@ export function egressDecision(
   // 4. Quarantine tier -- the ONLY tier a main agent cannot reach. Exact
   //    agent_type match required (fail-closed: anything else falls through to
   //    the block below).
+  //
+  //    In the allowlist posture (the default) the named domains are the whole
+  //    grant, exactly as before the switch existed. In the denylist posture
+  //    two sub-cases, in this order:
+  //    (a) the shipped feeds and operator additions -- allowed as before, so
+  //        flipping the posture can never break a long-standing source;
+  //    (b) anything else -- allowed UNLESS the deny rules catch it. The
+  //        re-check is defence in depth: step 0 already refused denied URLs,
+  //        and this keeps that true even if someone later reorders the steps.
   if (String(agentType ?? '') === QUARANTINE_AGENT_TYPE) {
     if (matchesQuarantineDomain(url, runtimeList.quarantineDomains ?? [])) {
       return { blocked: false, tier: 'quarantine' }
     }
-    // Open mode: the curated list no longer decides, but the denylist and the
-    // public-host check still do. A refusal here is logged with its reason, so
-    // "open" never means "unobservable".
-    if (runtimeList.quarantineOpen === true) {
-      const verdict = openModeDecision(url, runtimeList.quarantineDenylist ?? [])
-      if (verdict.allowed) return { blocked: false, tier: 'quarantine-open' }
-      return { blocked: true, tier: 'quarantine-open-deny', reason: verdict.reason }
+    if (openReader) {
+      if (!isQuarantineDenied(url)) return { blocked: false, tier: 'quarantine-open' }
+      return { blocked: true, tier: 'quarantine-denied' }
     }
   }
 
@@ -518,51 +397,32 @@ export function payloadKeySignature(payload) {
 // an agent-type name from a fixed set -- not content, not a url, not a secret
 // -- and without it a denied sub-agent call cannot be told apart from a denied
 // main-agent one, which is exactly the distinction this log now exists to make.
-// B3/B4 (Argus, 2026-09-18, both reproduced): the decision is made on the
-// PARSED url, the log wrote the RAW one. The WHATWG parser drops a newline, a
-// log file does not -- so a single WebFetch could append a complete, forged,
-// attacker-timestamped ALLOWED_QUARANTINE_OPEN line. And in open mode the full
-// query string of EVERY fetch landed in the file: tokens, presigned URLs,
-// session ids, in a file meant for casual reading.
+// Verifying this gate by hand -- piping a payload into it after an allowlist
+// change -- writes an ALLOWED_QUARANTINE line for a request that never left the
+// machine. fetch-budget.py then counts it against the source's daily allowance,
+// and its own comment says the opposite: "Only fetches that actually left the
+// machine count against a source." Measured 2026-08-28: seven such phantom
+// lines, one on every domain approved that morning, and the caller read them
+// back as real traffic before starting a sweep.
 //
-// So the log gets origin + pathname, plus the query KEY NAMES only -- the same
-// rule payloadKeySignature already applies to the payload: a name is
-// descriptive, a value can be a secret. Anything unparseable is percent-escaped
-// rather than trusted.
-export function logSafeUrl(raw) {
-  const escape = (v) => String(v).replace(/[\r\n\t"\\]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).padStart(2, '0'))
-  let u
-  try {
-    u = new URL(String(raw ?? ''))
-  } catch {
-    return { url: escape(String(raw ?? '').slice(0, 300)), queryKeys: '' }
-  }
-  // A key name is attacker-chosen too: escape the separators that would make
-  // one key look like two log FIELDS (space, '='), and cap the count so a URL
-  // with 500 parameters cannot push the rest of the line off the screen.
-  // '+' is escaped as well, so the "+N" truncation marker below cannot be
-  // confused with a query key that happens to be called "+13" (Argus).
-  const keyEscape = (v) => escape(v).replace(/[ =+]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).padStart(2, '0'))
-  const all = [...new Set([...u.searchParams.keys()])]
-  const shown = all.slice(0, 12).map(keyEscape)
-  if (all.length > shown.length) shown.push(`+${all.length - shown.length}`)
-  return { url: escape(u.origin + u.pathname), queryKeys: shown.join(',') }
-}
+// EGRESS_GATE_SELFTEST=1 prefixes the log kind with SELFTEST_ so those lines
+// are visibly not traffic. It NEVER touches the decision -- allow and deny come
+// out exactly the same with it set or unset -- because a gate with a switch
+// that changes what it permits is not a gate.
+//
+// If the variable is ever left set in a live session, real fetches log as
+// SELFTEST_ and go uncounted. That fails quiet, so fetch-budget.py should say
+// out loud when it skips SELFTEST_ lines rather than silently reporting less.
+const SELFTEST = process.env.EGRESS_GATE_SELFTEST === '1'
 
 function logLine(kind, url, detail, keys = '', agentType = '') {
   try {
     mkdirSync(join(REPO_ROOT, 'store'), { recursive: true })
     const ts = new Date().toISOString()
-    const keyPart = keys ? ` payload_keys="${String(keys).replace(/[^A-Za-z0-9_,.-]/g, '')}"` : ''
-    const safe = logSafeUrl(url)
-    const queryPart = safe.queryKeys ? ` query_keys="${safe.queryKeys}"` : ''
-    // `detail` is built by this file from a fixed set of reasons, never from
-    // fetched content; the url and the agent type are the caller-influenced
-    // parts and both are escaped above.
-    const safeDetail = String(detail).replace(/[\r\n]/g, ' ')
-    const safeAgent = String(agentType).replace(/[^A-Za-z0-9_-]/g, '')
-    const agentSafe = safeAgent ? ` agent_type="${safeAgent}"` : ''
-    appendFileSync(EGRESS_BLOCK_LOG, `${ts} ${kind} url="${safe.url}"${queryPart} ${safeDetail}${agentSafe}${keyPart}\n`, 'utf-8')
+    if (SELFTEST) kind = `SELFTEST_${kind}`
+    const keyPart = keys ? ` payload_keys="${keys}"` : ''
+    const agentPart = agentType ? ` agent_type="${agentType}"` : ''
+    appendFileSync(EGRESS_BLOCK_LOG, `${ts} ${kind} url="${url}" ${detail}${agentPart}${keyPart}\n`, 'utf-8')
   } catch {
     // Never let log failure cascade into blocking the agent process itself.
   }
@@ -602,14 +462,6 @@ function isInvokedDirectly() {
 }
 
 if (isInvokedDirectly()) {
-  // Async because the reader's open path resolves DNS before allowing (see
-  // resolvesInward). Any throw inside must still end in a DECISION, never in an
-  // unhandled rejection that leaves the tool call hanging -- and for the one
-  // path that can throw, that decision is a denial (Argus F7: the first version
-  // fell back to allow(), which contradicted the file's own fail-closed
-  // doctrine at exactly the tier that has no curated list behind it).
-  let readerOpenPath = false
-  await (async () => {
   let payload
   try {
     payload = JSON.parse(readFileSync(0, 'utf-8'))
@@ -619,63 +471,16 @@ if (isInvokedDirectly()) {
   const url = String(payload?.tool_input?.url ?? '')
   const agentType = String(payload?.agent_type ?? '')
   const runtimeList = loadRuntimeAllowlist()
-  readerOpenPath = agentType === QUARANTINE_AGENT_TYPE && runtimeList.quarantineOpen === true
   const decision = egressDecision(payload?.tool_name, payload?.tool_input, runtimeList, agentType)
   if (decision.blocked) {
-    const reason = decision.tier === 'quarantine-open-deny'
-      ? `reason="open quarantine tier refused: ${decision.reason}"`
-      : 'reason="not on egress allowlist"'
-    logLine('BLOCKED', url, reason, payloadKeySignature(payload), agentType)
-    deny(decision.tier === 'quarantine-open-deny'
-      ? `Egress TILTOTT: a karanten-olvaso nyitott modban is tiltott celt kert (${decision.reason}). ` +
-        'Nem publikus host, nem http(s), nem szabvanyos port, vagy tiltolistas cel (paste-oldal, ' +
-        'webhook-gyujto, linkroviditо, fajl-dobozok, bot-API). A hivas rogzitve a store/egress-blocked.log fajlban.'
-      : BLOCK_MESSAGE)
+    logLine('BLOCKED', url, 'reason="not on egress allowlist"', payloadKeySignature(payload), agentType)
+    deny(BLOCK_MESSAGE)
   }
-
-  // THE RESOLVED-ADDRESS CHECK IS HOST-SCOPED, NOT TIER-SCOPED (Argus F6).
-  // Tying it to the open tier alone made the same URL allowed or denied
-  // depending on which list happened to name it: with quarantine_domains:[]
-  // "localho.st" was denied (resolves to ::1), and with it listed, allowed.
-  // The live file carries ~150 such entries plus their subdomains, all
-  // unverified. So while the reader runs in open mode, EVERY allowing tier
-  // goes through the same address check -- a name that resolves inward is
-  // never reachable from the reader, whatever list it is on.
-  // Scope, stated at the top of this file and now honoured here too (Argus N2):
-  // this gate covers WebFetch calls that carry a url. Without the guard the
-  // address check ran on every tool call the reader makes and denied the ones
-  // with no url at all -- it could never grant anything, but the refusal
-  // reason would have been nonsense.
-  if (readerOpenPath && url && decision.tier !== 'not-webfetch' && decision.tier !== 'no-url') {
-    let host = ''
-    try { host = new URL(url).hostname } catch { host = '' }
-    const verdict = host ? await resolvesInward(host) : { inward: true, reason: 'unparseable host' }
-    if (verdict.inward) {
-      logLine('BLOCKED', url, `reason="reader refused: ${verdict.reason}"`, payloadKeySignature(payload), agentType)
-      deny('Egress TILTOTT: a cel neve publikus, de BELSO cimre mutat (' + verdict.reason + '). ' +
-        'A karanten-olvaso nem erhet el loopback, maganhalozati vagy metaadat-cimet. Rogzitve a store/egress-blocked.log fajlban.')
-    }
-  }
-
   // Audited, not silent: the quarantine tier is the one grant a main agent
   // cannot obtain, so every use of it leaves a line next to the denials. The
   // other tiers are the ordinary allowlist and stay quiet.
   if (decision.tier === 'quarantine') {
     logLine('ALLOWED_QUARANTINE', url, 'reason="quarantine-reader tier"', '', agentType)
   }
-  // Open mode replaces per-domain approval with per-fetch AUDIT: the owner no
-  // longer sees the list in advance, so every open-tier fetch must leave a line.
-  if (decision.tier === 'quarantine-open') {
-    logLine('ALLOWED_QUARANTINE_OPEN', url, 'reason="open quarantine tier"', '', agentType)
-  }
   allow()
-  })().catch(() => {
-    // Fail-closed where the open tier is in play, fail-open elsewhere: a main
-    // agent still has the curated list behind it, so a hook crash must not
-    // break its ordinary work.
-    if (readerOpenPath) {
-      deny('Egress TILTOTT: a kapu nem tudott dontest hozni (belso hiba), nyitott modban ez elutasitast jelent.')
-    }
-    allow()
-  })
 }

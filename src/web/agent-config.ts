@@ -31,6 +31,9 @@ export const MODEL_ALIASES: Record<string, string> = {
   'opus-5': 'claude-opus-5',
   'opus5': 'claude-opus-5',
   'haiku': 'claude-haiku-4-5-20251001',
+  'fable': 'claude-fable-5',
+  'fable-5': 'claude-fable-5',
+  'fable5': 'claude-fable-5',
   'inherit': DEFAULT_MODEL,
 }
 
@@ -331,6 +334,35 @@ export function readAgentRemoteHost(name: string): string | null {
   return readAgentRemoteConfig(name).host
 }
 
+// A POSIX-ish account name. Deliberately narrow: this value is passed to
+// `sudo -u`, so anything outside [a-z0-9_-] (and a leading letter/underscore)
+// is rejected rather than escaped. 32 chars is the useradd limit.
+const RUN_AS_USER_ALLOWED = /^[a-z_][a-z0-9_-]{0,31}$/
+
+// Pure resolver: which OS user this agent's tmux server belongs to, or null when
+// the agent shares the router's own user (today's default for every agent).
+//
+// Why this exists: tmux refuses a cross-user connection even when the socket
+// permissions allow it (measured 2026-08-19: "access not allowed"), so reaching
+// an agent that runs under its own uid means running tmux AS that user. The
+// value is only ever used with `sudo -n -u <user> tmux ...`, backed by a
+// per-agent sudoers rule that grants that one binary and nothing else.
+export function resolveRunAsUser(rawConfigJson: string): string | null {
+  let config: unknown
+  try { config = JSON.parse(rawConfigJson) } catch { return null }
+  if (!config || typeof config !== 'object') return null
+  const raw = (config as Record<string, unknown>).runAsUser
+  if (typeof raw !== 'string') return null
+  const user = raw.trim()
+  if (!user || !RUN_AS_USER_ALLOWED.test(user)) return null
+  return user
+}
+
+export function readAgentRunAsUser(name: string): string | null {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  return resolveRunAsUser(readFileOr(configPath, '{}'))
+}
+
 // Validate-and-persist the remote config. Empty strings clear the fields
 // (revert the agent to local). Returns the resolved config on success, or an
 // error string when a non-empty value fails validation.
@@ -426,6 +458,39 @@ export function writeAgentMemoryIsolation(name: string, enabled: boolean): void 
   try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
   if (enabled) config.memoryIsolation = true
   else delete config.memoryIsolation
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// Opt-in per-agent worksource channel (default OFF). When true the router hands
+// inter-agent messages to this agent by writing a file into its worksource
+// queue instead of typing them into its tmux pane, and the launcher loads the
+// worksource channel plugin for it.
+//
+// DELIBERATELY ITS OWN FLAG, not folded into `channelProvider` or `hasChannel`.
+// `hasChannel` is derived from the presence of a chat-provider TOKEN FILE
+// (agent-process.ts), and it gates the plugin watchdog, the /mcp unlock driver
+// and `--continue` suppression. An agent whose only channel is worksource has
+// no bot poller for the watchdog to find, so reusing `hasChannel` would make it
+// read "plugin down" forever and enter its restart ladder -- a restart loop
+// caused purely by wiring. Keeping this orthogonal is what lets a worksource
+// agent stay invisible to every chat-channel monitor.
+export function readAgentWorksourceChannel(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.worksourceChannel === true
+  } catch { /* fall through */ }
+  return false
+}
+
+// Persist the opt-in worksourceChannel flag. `false` removes the key so the
+// config file stays minimal and the default-OFF semantics remain explicit.
+export function writeAgentWorksourceChannel(name: string, enabled: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  if (enabled) config.worksourceChannel = true
+  else delete config.worksourceChannel
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
@@ -626,6 +691,53 @@ export function readAgentCapabilities(name: string): string[] {
     if (Array.isArray(config.capabilities)) return config.capabilities
   } catch { /* fall through to persona */ }
   return parsePersonaCapabilities(name)
+}
+
+// ---- per-agent tool-name deny --------------------------------------------
+//
+// ORSIKTXRATA914 / 2026-09-14 (Iris measured, Dani confirmed): a whole-tool-name
+// deny in the agent's .claude/settings.json (e.g. "Artifact") does not only
+// block the tool, it REMOVES the tool schema from the prompt -- on Orsi that
+// was 56% of a 64.7k-token base load. But writeAgentSettingsFromProfile()
+// replaces permissions.deny WHOLESALE from the security profile on every
+// spawn, so a hand-edited deny silently reverts at the next respawn (Orsi
+// respawns 2-3x a day). Same class as PROFILREGRESS908: settings.json is a
+// DERIVED file here, not a durable one.
+//
+// The durable per-agent home is agent-config.json "toolDeny" -- the same
+// place "capabilities" lives -- which the scaffold merges into the deny list
+// on every spawn. Putting the names into the shared profile template instead
+// would hit every agent on that profile (and every customer install): a
+// per-agent experiment belongs in per-agent config.
+//
+// Only bare tool names are accepted (Claude Code rule shape "ToolName" or
+// "mcp__server__tool"), never a "Tool(pattern)" rule: this field can only
+// ever WIDEN the deny list, and a name-shaped whitelist keeps a mistyped or
+// injected value from becoming a pattern rule with surprising reach.
+const TOOL_DENY_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,127}$/
+export const TOOL_DENY_MAX_PER_AGENT = 64
+
+export function sanitizeToolDenyList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  for (const v of raw) {
+    if (typeof v !== 'string') continue
+    const t = v.trim()
+    if (!TOOL_DENY_NAME_RE.test(t) || out.includes(t)) continue
+    out.push(t)
+    if (out.length >= TOOL_DENY_MAX_PER_AGENT) break
+  }
+  return out
+}
+
+export function readAgentToolDeny(name: string): string[] {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return sanitizeToolDenyList(config.toolDeny)
+  } catch {
+    return []
+  }
 }
 
 export function writeAgentCapabilities(name: string, capabilities: string[]): void {

@@ -14,7 +14,7 @@
 //   Moonshot   https://api.moonshot.ai/anthropic     (kimi-* models)
 //   Zhipu      https://api.z.ai/api/anthropic         (glm-* models)
 //   OpenRouter https://openrouter.ai/api              (SDK appends /v1/messages)
-//   Ollama     $OLLAMA_URL (/v1/messages)             (token literally "ollama")
+//   Ollama     $AGENT_LOCAL_BASE_URL (/v1/messages)             (token literally "ollama")
 // NOT available: OpenAI and Google Gemini -- those need their own CLI or the
 // native-api runtime; never route them through here.
 //
@@ -24,7 +24,7 @@
 // titkot a hívó adja át `secretLookup`-on keresztül, hogy vault nélkül
 // tesztelhető legyen.
 
-import { OLLAMA_URL } from '../config.js'
+import { AGENT_LOCAL_BASE_URL } from '../config.js'
 import { shSingleQuote } from './shell-quote.js'
 import { inferProvider } from './resolve-spec.js'
 import { providerSecretIds } from './secret-ids.js'
@@ -86,7 +86,7 @@ export function resolveProviderEnvVars(
     case 'google':
       return {}
     case 'ollama':
-      return { ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_BASE_URL: OLLAMA_URL, ANTHROPIC_MODEL: model }
+      return { ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_BASE_URL: AGENT_LOCAL_BASE_URL, ANTHROPIC_MODEL: model }
     case 'minimax':
       return {
         ANTHROPIC_AUTH_TOKEN: firstSecret(providerSecretIds('minimax'), secretLookup),
@@ -157,7 +157,7 @@ export function resolveProviderEnv(
     case 'ollama':
       return {
         provider: 'ollama',
-        exportsStr: `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && export ANTHROPIC_MODEL=${modelQ} && `,
+        exportsStr: `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${AGENT_LOCAL_BASE_URL} && export ANTHROPIC_MODEL=${modelQ} && `,
       }
     case 'openai':
     case 'google':

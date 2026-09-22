@@ -322,6 +322,16 @@ export const KANBAN_WIP_OVER_COLOR = env['KANBAN_WIP_OVER_COLOR'] ?? '#c53030'
 // requiresRestart registry keys: read through the override layer so a value
 // saved on the Settings page takes effect on the next restart.
 export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
+// Where the AGENTS reach the dashboard API from wherever they run. This is a
+// DIFFERENT question from DASHBOARD_PUBLIC_URL, which answers "where does the
+// BROWSER reach the dashboard" and feeds the CORS allowlist. On a single-host
+// install the two answers differ: measured 2026-09-03, the public name resolves
+// but its 443 is unreachable from the host itself (hairpin NAT), so every
+// generated curl example pointed at a dead address -- `curl exit 7`, i.e. the
+// agent gets nothing, not an error it could report. Deriving one answer from
+// the other cannot be correct for both deployment shapes, so it is its own key.
+// Empty preserves the previous behaviour exactly (public URL, else localhost).
+export const AGENT_API_ORIGIN = cfg('AGENT_API_ORIGIN') ?? ''
 // Extra browser origins allowed to make state-changing dashboard requests
 // (CORS + CSRF allowlist), comma-separated, e.g. for VPN/LAN addresses that
 // aren't covered by WEB_HOST or DASHBOARD_PUBLIC_URL. Empty by default so
@@ -329,6 +339,9 @@ export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
 // key, so it stays a plain env read (not routed through the override layer).
 export const DASHBOARD_ALLOWED_ORIGINS = env['DASHBOARD_ALLOWED_ORIGINS'] ?? ''
 export const OLLAMA_URL = cfg('OLLAMA_URL') ?? 'http://localhost:11434'
+// Ollama model that tiers memories during /api/memories/import. Empty = off:
+// every chunk goes to warm with no model call, instead of guessing a model.
+export const MEMORY_IMPORT_CATEGORIZE_MODEL = (cfg('MEMORY_IMPORT_CATEGORIZE_MODEL') ?? '').trim()
 
 // Kanban swimlanes: which field the board groups by on first load. Invalid
 // values silently fall back to 'none' (flat board) rather than breaking the
@@ -421,3 +434,30 @@ export const SUBAGENT_TELEGRAM_WAKE_ENABLED =
 export const HEARTBEAT_CALENDAR_ACCOUNT = (cfg('HEARTBEAT_CALENDAR_ACCOUNT') ?? '').trim()
 export const HEARTBEAT_END_HOUR = parseInt(env['HEARTBEAT_END_HOUR'] ?? '23', 10)
 export const HEARTBEAT_CALENDAR_ID = (cfg('HEARTBEAT_CALENDAR_ID') ?? '').trim()
+
+// The embedding model is deliberately NOT tied to OLLAMA_URL or to the chat
+// model. agent-process.ts feeds OLLAMA_URL into ANTHROPIC_BASE_URL for
+// ollama-backed agents, and memories/connectors/migrate all call the NATIVE
+// ollama API on it -- five consumers in total -- so repointing that one key to
+// change the embedding endpoint drags four unrelated callers along with it.
+//
+// EMBED_DIMS implements Matryoshka truncation: slicing the native vector and
+// letting cosine renormalise. Measured on a 1073-memory corpus, vector-only
+// retrieval, 2026-08-12: 1024 dims held hit@5 at 83% while cutting the stored
+// vector text from 94 MB to ~24 MB and the per-search parse from 291 ms to
+// ~73 ms.
+//
+// Empty EMBED_URL = use OLLAMA_URL and EMBED_DIMS 0 = no truncation, so an
+// install that sets nothing keeps exactly the previous behaviour.
+export const EMBED_URL = cfg('EMBED_URL') || OLLAMA_URL
+export const EMBED_MODEL = cfg('EMBED_MODEL') ?? 'nomic-embed-text'
+const rawEmbedDims = parseInt(cfg('EMBED_DIMS') ?? '0', 10)
+export const EMBED_DIMS = Number.isFinite(rawEmbedDims) && rawEmbedDims > 0 ? rawEmbedDims : 0
+
+// The base URL an OLLAMA-CLASSED agent talks to is not the same thing as the
+// ollama API this install uses elsewhere. agent-process.ts only needs an
+// ANTHROPIC-compatible /v1/messages endpoint; the other four OLLAMA_URL
+// callers need the native ollama API (/api/tags, /api/generate), which an
+// Anthropic-compatible proxy does not serve at all. Empty = fall back to
+// OLLAMA_URL, so an install whose local agent really is ollama is unaffected.
+export const AGENT_LOCAL_BASE_URL = cfg('AGENT_LOCAL_BASE_URL') || OLLAMA_URL

@@ -360,9 +360,6 @@ function switchPage(pageId) {
   openSidebarGroupForPage(pageId)
   // Kanban needs full-width layout (overrides main's max-width: 1200px)
   document.querySelector('main').classList.toggle('kanban-active', pageId === 'kanban')
-  // Activity page runs a live poll; stop it whenever we navigate away.
-  if (pageId !== 'activity') stopActivityPoll()
-  if (pageId === 'activity') startActivityPoll()
   // Agents page tints each Terminal button green while that agent is working;
   // same 3s poll + source as Activity. Stop it when we leave the page.
   if (pageId !== 'agents') stopAgentsBusyPoll()
@@ -431,7 +428,9 @@ const SIDEBAR_GROUPS_LS_KEY = 'marveen.sidebarGroups'
 // into their group containers per this map, so regrouping a page (say, moving
 // naplo under system) or relabeling a group is a one-line change right here.
 const SIDEBAR_GROUPS = [
-  { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'activity', 'messages', 'tasks', 'bgTasks'] },
+  // 'activity' is gone: the live per-agent status is now the Agents page's
+  // "Aktivitás" card mode, so it has no page, no nav entry and no URL.
+  { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'messages', 'tasks', 'bgTasks'] },
   { key: 'knowledge',   labelKey: 'nav.group.knowledge',   pages: ['memories', 'skills', 'research', 'ideas'] },
   { key: 'stats',       labelKey: 'nav.group.stats',       pages: ['costs', 'tokenUsage'] },
   { key: 'system',      labelKey: 'nav.group.system',      pages: ['status', 'naplo', 'updates', 'settings', 'vault'] },
@@ -536,7 +535,6 @@ const STATIC_I18N_MAP = {
 // Page id -> { title key, subtitle key (or null) }
 const PAGE_HEADER_I18N = {
   agentsPage:     { title: 'agents.page_title',     sub: 'agents.page_subtitle' },
-  activityPage:   { title: 'activity.page_title',   sub: 'activity.page_subtitle' },
   tasksPage:      { title: 'tasks.page_title',       sub: 'tasks.page_subtitle' },
   skillsPage:     { title: 'skills.page_title',      sub: 'skills.page_subtitle' },
   memoriesPage:   { title: 'memories.page_title',    sub: 'memories.page_subtitle' },
@@ -589,8 +587,10 @@ function renderStaticI18n() {
   // Messages empty state
   const chatEmpty = document.querySelector('.chat-thread-empty p')
   if (chatEmpty) chatEmpty.textContent = t('messages.select_agent')
-  // Team hint
-  const teamHint = document.querySelector('#teamPage > p')
+  // Team hint. Lives under the Agents page org-chart view since the separate
+  // Team page was merged in; the old '#teamPage > p' selector matched nothing
+  // and left the hint stuck on its hard-coded Hungarian.
+  const teamHint = document.getElementById('teamHint')
   if (teamHint) teamHint.textContent = t('team.hint')
 
   // Overview stat labels (siblings of statAgents, statTasks, statMemories, statSkills)
@@ -681,8 +681,9 @@ if (document.readyState !== 'loading') {
 // === Activity (live agent status) ===
 // ============================================================
 
-let activityTimer = null
-
+// The Activity page is gone -- its live per-agent status is the Agents page's
+// "Aktivitás" card mode (see renderAgentCardActivity). This table is the shared
+// vocabulary: the same states, labels, colours and tooltips as before.
 const ACTIVITY_STATE_META = {
   working: { label: () => t('activity.state.working'), cls: 'act-working', tip: 'Élő állapot (a tmux pane tartalmából, 3 másodpercenként): éppen dolgozik / gondolkodik.' },
   idle: { label: () => t('activity.state.idle'), cls: 'act-idle', tip: 'Élő állapot (3 másodpercenként): fut, de épp nem csinál semmit.' },
@@ -715,87 +716,38 @@ document.addEventListener('visibilitychange', () => {
   }
 })
 
-function startActivityPoll() {
-  loadActivity()
-  if (activityTimer) clearInterval(activityTimer)
-  activityTimer = setInterval(loadActivity, 3000)
-}
+// Permission-mode chip. Shown for every mode EXCEPT the ones that let the agent
+// work on its own -- inverted on purpose: an unfamiliar mode is exactly the one
+// worth surfacing, so a future Claude Code mode shows up here instead of hiding
+// behind a list nobody remembered to extend. Without this an agent parked in an
+// ask-first mode renders as plain 'idle', which is how one sat unusable for
+// hours on 2026-07-27.
+const AUTONOMOUS_MODES = ['bypass permissions', 'accept edits', 'auto mode']
 
-function stopActivityPoll() {
-  if (activityTimer) {
-    clearInterval(activityTimer)
-    activityTimer = null
-  }
+// The live status body of one agent card in "Aktivitás" mode: the state badge,
+// the permission-mode chip and the last few lines of the agent's pane. Same
+// markup the Activity page used, minus the name row -- the card already carries
+// the avatar, name and description above it.
+function agentActivityBodyHtml(entry) {
+  const metaRaw = ACTIVITY_STATE_META[entry.state] || ACTIVITY_STATE_META.unknown
+  const label = typeof metaRaw.label === 'function' ? metaRaw.label() : metaRaw.label
+  const tail = (entry.tail || []).map((l) => escapeHtml(l)).join('\n')
+  const modeChip = entry.mode && !AUTONOMOUS_MODES.includes(entry.mode)
+    ? '<span class="act-mode-badge" title="' + escapeHtml(t('activity.tooltip.mode', { mode: entry.mode })) + '">' + escapeHtml(entry.mode) + '</span>'
+    : ''
+  const termIcon = entry.running
+    ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
+    : ''
+  return (
+    '<div class="agent-act-head">' +
+      '<span class="activity-badge ' + metaRaw.cls + '" title="' + escapeHtml(metaRaw.tip || '') + '">' + (entry.state === 'working' ? '<span class="act-orb" aria-hidden="true"></span>' : '') + escapeHtml(label) + '</span>' +
+      '<span class="agent-act-head-right">' + modeChip + termIcon + '</span>' +
+    '</div>' +
+    (tail
+      ? '<pre class="activity-tail">' + tail + '</pre>'
+      : '<p class="activity-tail-empty">' + (entry.running ? t('agents.card.no_output') : t('agents.card.not_running')) + '</p>')
+  )
 }
-
-async function loadActivity() {
-  try {
-    const res = await fetch('/api/agents/activity')
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const entries = await res.json()
-    renderActivity(entries)
-    const upd = document.getElementById('activityUpdated')
-    if (upd) upd.textContent = t('activity.updated', { time: new Date().toLocaleTimeString('hu-HU') })
-  } catch (e) {
-    const list = document.getElementById('activityList')
-    if (list) list.innerHTML = '<p class="activity-empty">' + t('activity.error_load') + ': ' + escapeHtml(String(e.message || e)) + '</p>'
-  }
-}
-
-function renderActivity(entries) {
-  const list = document.getElementById('activityList')
-  if (!list) return
-  if (!Array.isArray(entries) || entries.length === 0) {
-    list.innerHTML = '<p class="activity-empty">' + t('activity.empty') + '</p>'
-    return
-  }
-  list.innerHTML = entries.map((a) => {
-    const metaRaw = ACTIVITY_STATE_META[a.state] || ACTIVITY_STATE_META.unknown
-    const meta = { ...metaRaw, label: typeof metaRaw.label === 'function' ? metaRaw.label() : metaRaw.label }
-    const tail = (a.tail || []).map((l) => escapeHtml(l)).join('\n')
-    const mainBadge = a.isMain ? '<span class="act-main-badge">' + t('activity.badge.main') + '</span>' : ''
-    // Permission-mode chip. Shown for every mode EXCEPT the ones that let the
-    // agent work on its own -- inverted on purpose: an unfamiliar mode is
-    // exactly the one worth surfacing, so a future Claude Code mode shows up
-    // here instead of hiding behind a list nobody remembered to extend.
-    // Without this an agent parked in an ask-first mode renders as plain
-    // 'idle', which is how one sat unusable for hours on 2026-07-27.
-    const AUTONOMOUS_MODES = ['bypass permissions', 'accept edits', 'auto mode']
-    const modeChip = a.mode && !AUTONOMOUS_MODES.includes(a.mode)
-      ? '<span class="act-mode-badge" title="' + escapeHtml(t('activity.tooltip.mode', { mode: a.mode })) + '">' + escapeHtml(a.mode) + '</span>'
-      : ''
-    const canOpen = !!a.running
-    const termIcon = canOpen
-      ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" title="' + t('activity.tooltip.terminal') + '"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
-      : ''
-    return (
-      '<div class="activity-card ' + meta.cls + (canOpen ? ' act-clickable' : '') + '" data-agent="' + escapeHtml(a.name) + '">' +
-        '<div class="activity-card-head">' +
-          '<span class="activity-name">' + escapeHtml(a.name) + mainBadge + '</span>' +
-          '<span style="display:flex;align-items:center;gap:8px">' +
-            modeChip +
-            termIcon +
-            '<span class="activity-badge ' + meta.cls + '" title="' + escapeHtml(meta.tip || '') + '">' + (a.state === 'working' ? '<span class="act-orb" aria-hidden="true"></span>' : '') + meta.label + '</span>' +
-          '</span>' +
-        '</div>' +
-        (tail
-          ? '<pre class="activity-tail">' + tail + '</pre>'
-          : '<p class="activity-tail-empty">' + (a.running ? 'nincs friss kimenet' : 'a session nem fut') + '</p>') +
-      '</div>'
-    )
-  }).join('')
-}
-
-// Event delegation: clicking a running activity-card opens the terminal modal
-;(() => {
-  const actList = document.getElementById('activityList')
-  if (actList) {
-    actList.addEventListener('click', (e) => {
-      const card = e.target.closest('.activity-card.act-clickable[data-agent]')
-      if (card) openTerminalModal(card.dataset.agent)
-    })
-  }
-})()
 
 
 // ============================================================
@@ -1455,12 +1407,28 @@ function createCardEl(card, embeddedChildren = []) {
     ? `<span class="kanban-card-seq" style="font-family:monospace;font-size:11px;color:var(--muted);margin-right:5px">#${card.seq}</span>`
     : ''
 
+  // Blocked marker: only counts blockers that are not done yet. A card whose
+  // blockers have all closed is not blocked any more, and a badge that stayed
+  // put would be exactly the kind of lie the board is supposed to prevent.
+  const openBlockers = Array.isArray(card.blockers)
+    ? card.blockers.filter((b) => b.status !== 'done')
+    : []
+  const blockedHtml = openBlockers.length > 0
+    ? `<span class="kanban-card-blocked" title="${escapeHtml(t('kanban.blocker.card_tooltip', { n: openBlockers.length }))}">${t('kanban.blocker.card_badge')}${openBlockers.length > 1 ? ' ' + openBlockers.length : ''}</span>`
+    : ''
+
   // Card aging: left stripe + top-right badge based on hours since last update.
   // Skipped for done cards. Config thresholds and colours come from window._marveen.kanbanAging.
   let agingBadgeHtml = ''
   const agingCfg = window._marveen?.kanbanAging
-  if (agingCfg && card.updated_at && card.status !== 'done') {
-    const hoursOld = (Date.now() / 1000 - card.updated_at) / 3600
+  // Age from the last STATUS CHANGE, not from updated_at. A comment sets
+  // updated_at (see addKanbanComment in src/db.ts), so a card that has not
+  // moved in weeks used to look fresh as soon as anyone wrote on it -- and the
+  // main agent writes on cards more than anyone. Falls back to updated_at only
+  // if the API is older than this field.
+  const agingBasis = card.last_status_at ?? card.updated_at
+  if (agingCfg && agingBasis && card.status !== 'done') {
+    const hoursOld = (Date.now() / 1000 - agingBasis) / 3600
     let agingLevel = null
     let agingColor = null
     if (hoursOld >= agingCfg.criticalH) {
@@ -1473,7 +1441,7 @@ function createCardEl(card, embeddedChildren = []) {
     if (agingLevel) {
       const days = Math.floor(hoursOld / 24)
       const ageLabel = days >= 1 ? `${days}d` : `${Math.floor(hoursOld)}h`
-      const exact = new Date(card.updated_at * 1000).toLocaleString('hu-HU')
+      const exact = new Date(agingBasis * 1000).toLocaleString('hu-HU')
       agingBadgeHtml = `<span class="kanban-card-aging-badge kanban-card-aging-${agingLevel}" style="color:${agingColor}" title="${t('kanban.aging.tooltip', { exact })}">⏳ ${ageLabel}</span>`
       el.dataset.aging = agingLevel
       el.style.setProperty('--card-aging-color', agingColor)
@@ -1498,7 +1466,7 @@ function createCardEl(card, embeddedChildren = []) {
   el.innerHTML = `
     ${projectHtml}
     <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
-    <div class="kanban-card-footer">${assigneeHtml}${dueHtml}</div>
+    <div class="kanban-card-footer">${assigneeHtml}${dueHtml}${blockedHtml}</div>
     ${labelsHtml}
     <div class="kanban-card-actions">
       <button class="card-breakdown-btn" title="${t('kanban.btn.breakdown')}" aria-label="${t('kanban.btn.breakdown')}">⚡</button>
@@ -1989,6 +1957,118 @@ async function renderCardLabelsSection(card) {
   }
 }
 
+// === Card blockers (in the detail modal) ===
+// Renders both directions from one GET: what this card waits on, and what waits
+// on it. The reverse list is read-only on purpose -- a block is removed from the
+// card that carries it, so there is exactly one place to clear each link.
+async function renderCardBlockersSection(card) {
+  const listEl = document.getElementById('cardBlockerList')
+  const addSelect = document.getElementById('cardBlockerAdd')
+  const blockingWrap = document.getElementById('cardBlockingWrap')
+  const blockingListEl = document.getElementById('cardBlockingList')
+  if (!listEl || !addSelect) return
+
+  let blockers = []
+  let blocking = []
+  try {
+    const data = await (await fetch(`/api/kanban/${encodeURIComponent(card.id)}/blockers`)).json()
+    blockers = Array.isArray(data.blockers) ? data.blockers : []
+    blocking = Array.isArray(data.blocking) ? data.blocking : []
+  } catch { /* leave empty -- the lists just stay blank */ }
+
+  // A blocker whose card is done no longer holds anything up. It stays listed
+  // (the link is history worth seeing) but reads as cleared, so a glance at the
+  // list answers "am I still waiting?" without opening each card.
+  const isCleared = (ref) => ref.status === 'done'
+
+  const refRow = (ref, removable) => {
+    const row = document.createElement('div')
+    row.className = 'blocker-row' + (isCleared(ref) ? ' blocker-cleared' : '')
+    const seq = ref.seq != null ? `#${ref.seq} ` : ''
+    const link = document.createElement('button')
+    link.className = 'blocker-link'
+    link.type = 'button'
+    link.textContent = `${seq}${ref.title}`
+    link.title = t('kanban.blocker.open_hint')
+    link.addEventListener('click', () => {
+      const target = kanbanCards.find((c) => c.id === ref.id)
+      if (target) showCardDetail(target)
+      else showToast(t('kanban.toast.blocker_not_on_board'))
+    })
+    row.appendChild(link)
+    const state = document.createElement('span')
+    state.className = 'blocker-state'
+    state.textContent = t(`kanban.status.${ref.status}`)
+    row.appendChild(state)
+    if (removable) {
+      const rm = document.createElement('button')
+      rm.className = 'blocker-remove'
+      rm.type = 'button'
+      rm.innerHTML = '&times;'
+      rm.title = t('kanban.blocker.remove_btn')
+      rm.setAttribute('aria-label', t('kanban.blocker.remove_btn'))
+      rm.addEventListener('click', async () => {
+        try {
+          await fetch(`/api/kanban/${encodeURIComponent(card.id)}/blockers/${encodeURIComponent(ref.id)}`, { method: 'DELETE' })
+          renderCardBlockersSection(card)
+          loadKanban()
+        } catch { showToast(t('kanban.toast.blocker_remove_error')) }
+      })
+      row.appendChild(rm)
+    }
+    return row
+  }
+
+  listEl.innerHTML = ''
+  if (blockers.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'blocker-empty'
+    empty.textContent = t('kanban.blocker.none')
+    listEl.appendChild(empty)
+  } else {
+    for (const ref of blockers) listEl.appendChild(refRow(ref, true))
+  }
+
+  blockingListEl.innerHTML = ''
+  blockingWrap.style.display = blocking.length > 0 ? '' : 'none'
+  for (const ref of blocking) blockingListEl.appendChild(refRow(ref, false))
+
+  // Candidates: every other open card on the board that is not already linked.
+  // Cards this one blocks are excluded too -- adding one would close a cycle,
+  // and the server refuses it; offering it in the list would only produce an error.
+  const attachedIds = new Set(blockers.map((b) => b.id))
+  const blockingIds = new Set(blocking.map((b) => b.id))
+  addSelect.innerHTML = `<option value="">-- ${t('kanban.blocker.add_placeholder_short')} --</option>`
+  for (const other of kanbanCards) {
+    if (other.id === card.id || attachedIds.has(other.id) || blockingIds.has(other.id)) continue
+    if (other.status === 'done') continue
+    const opt = document.createElement('option')
+    opt.value = other.id
+    opt.textContent = (other.seq != null ? `#${other.seq} ` : '') + other.title.slice(0, 70)
+    addSelect.appendChild(opt)
+  }
+  addSelect.onchange = async () => {
+    const blockerId = addSelect.value
+    if (!blockerId) return
+    try {
+      const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/blockers`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ blockerId }),
+      })
+      if (!r.ok) {
+        // The server's message names the actual reason (cycle, missing card);
+        // surfacing it beats a generic failure the operator has to guess at.
+        const err = await r.json().catch(() => ({}))
+        showToast(err.error || t('kanban.toast.blocker_add_error'))
+        addSelect.value = ''
+        return
+      }
+      renderCardBlockersSection(card)
+      loadKanban()
+    } catch { showToast(t('kanban.toast.blocker_add_error')) }
+  }
+}
+
 // === Card detail ===
 async function showCardDetail(card) {
   // Running number (#N) in the title bar, plus the stable hex id in the meta.
@@ -2134,6 +2214,7 @@ async function showCardDetail(card) {
   document.getElementById('cardDetailDesc').textContent = card.description || ''
 
   renderCardLabelsSection(card)
+  renderCardBlockersSection(card)
 
   // #115: Parent meta row — dropdown replaces the old read-only display; shown only when editable
   const parentMetaItem = document.getElementById('parentMetaItem')
@@ -2999,6 +3080,167 @@ function setupAutoRestartUI(agent) {
   }
 }
 
+// ---- context-guard UI -------------------------------------------------------
+
+const CG_PHASE_LABELS = {
+  idle: 'idle',
+  'await-handoff': 'handoff',
+  'await-ready': 'restarting',
+  cooldown: 'cooldown',
+}
+
+// One-sentence tooltips for the phase badge (CGBADGE908) -- the context badge
+// already had one (agents.context_tip), the phase badge had none, and the
+// owner had to ask what "cooldown" meant.
+const CG_PHASE_TIPS = {
+  'await-handoff': 'agents.guard_phase_tip_handoff',
+  'await-ready': 'agents.guard_phase_tip_restarting',
+  cooldown: 'agents.guard_phase_tip_cooldown',
+}
+
+async function setupContextGuardUI(agentName) {
+  const cgEnabled = document.getElementById('cgEnabled')
+  const cgAdvancedWrap = document.getElementById('cgAdvancedWrap')
+  if (!cgEnabled || !cgAdvancedWrap) return
+
+  if (cgEnabled.dataset.wired !== '1') {
+    cgEnabled.addEventListener('change', () => {
+      cgAdvancedWrap.hidden = !cgEnabled.checked
+    })
+    cgEnabled.dataset.wired = '1'
+  }
+
+  const cgActPct = document.getElementById('cgActPct')
+  const cgHardPct = document.getElementById('cgHardPct')
+  const cgValidationHint = document.getElementById('cgValidationHint')
+  const validatePcts = () => {
+    const invalid = Number(cgHardPct.value) < Number(cgActPct.value)
+    if (cgValidationHint) cgValidationHint.style.display = invalid ? '' : 'none'
+  }
+  if (cgActPct && cgActPct.dataset.cgwired !== '1') {
+    cgActPct.addEventListener('input', validatePcts)
+    cgHardPct.addEventListener('input', validatePcts)
+    cgActPct.dataset.cgwired = '1'
+  }
+
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/context-guard`)
+    if (!r.ok) return
+    const body = await r.json()
+    const cfg = body.contextGuard || {}
+    cgEnabled.checked = cfg.enabled === true
+    cgAdvancedWrap.hidden = !cgEnabled.checked
+    const cgLimitTokens = document.getElementById('cgLimitTokens')
+    if (cgLimitTokens) cgLimitTokens.value = cfg.limitTokens ? String(cfg.limitTokens) : ''
+    if (cgActPct) cgActPct.value = cfg.actPct != null ? Math.round(cfg.actPct * 100) : 90
+    if (cgHardPct) cgHardPct.value = cfg.hardPct != null ? Math.round(cfg.hardPct * 100) : 97
+    const cgCooldownMinutes = document.getElementById('cgCooldownMinutes')
+    if (cgCooldownMinutes) cgCooldownMinutes.value = cfg.cooldownMinutes ?? 15
+    const cgHandoffTimeout = document.getElementById('cgHandoffTimeout')
+    if (cgHandoffTimeout) cgHandoffTimeout.value = cfg.handoffTimeoutMinutes ?? 20
+  } catch { /* silent */ }
+
+  updateContextGuardLiveStatus(agentName)
+}
+
+function updateContextGuardLiveStatus(agentName) {
+  const liveEl = document.getElementById('cgLiveStatus')
+  const phaseEl = document.getElementById('cgPhaseDisplay')
+  const pctEl = document.getElementById('cgPctDisplay')
+  if (!liveEl || !phaseEl || !pctEl) return
+  fetch('/api/context-guard')
+    .then(r => r.ok ? r.json() : null)
+    .then(body => {
+      if (!body || !Array.isArray(body.agents)) return
+      const entry = body.agents.find(a => a.agent === agentName)
+      if (!entry) return
+      liveEl.style.display = ''
+      phaseEl.textContent = CG_PHASE_LABELS[entry.phase] || entry.phase || '-'
+      pctEl.textContent = typeof entry.pct === 'number' ? Math.round(entry.pct * 100) + '%' : '-'
+    })
+    .catch(() => {})
+}
+
+;(function startContextGuardPoll() {
+  function poll() {
+    fetch('/api/context-guard')
+      .then(r => r.ok ? r.json() : null)
+      .then(body => {
+        if (!body || !Array.isArray(body.agents)) return
+        body.agents.forEach(entry => {
+          const card = document.querySelector(`.agent-card[data-name="${CSS.escape(entry.agent)}"]`)
+          if (!card) return
+          let badge = card.querySelector('.ctx-guard-badge')
+          const active = entry.phase && entry.phase !== 'idle'
+          if (!active) { if (badge) badge.remove(); return }
+          if (!badge) {
+            badge = document.createElement('span')
+            badge.className = 'ctx-guard-badge'
+            badge.style.cssText = 'font-size:10px;padding:1px 5px;border-radius:10px;background:var(--accent-warning,#f59e0b);color:#000;margin-left:4px;font-weight:600'
+            const footer = card.querySelector('.agent-card-footer')
+            if (footer) footer.appendChild(badge)
+          }
+          // CGBADGE908: the phase badge never appends the context pct -- the
+          // card already has its own context badge, and "cooldown 19%" read as
+          // a cooldown position while 19 was the context fill measured at a
+          // different poll instant (so the same number appeared twice on one
+          // card with two values). In cooldown the number is what the word
+          // promises: the remaining time.
+          let cgLabel = CG_PHASE_LABELS[entry.phase] || entry.phase
+          if (entry.phase === 'cooldown' && typeof entry.cooldownUntilMs === 'number') {
+            const minLeft = Math.max(0, Math.ceil((entry.cooldownUntilMs - Date.now()) / 60000))
+            cgLabel += ` ${minLeft}m`
+          }
+          badge.textContent = cgLabel
+          const cgTipKey = CG_PHASE_TIPS[entry.phase]
+          badge.title = cgTipKey ? t(cgTipKey) : ''
+        })
+        if (currentAgent && document.getElementById('cgLiveStatus')) {
+          updateContextGuardLiveStatus(currentAgent.autoRestartId || currentAgent.name)
+        }
+      })
+      .catch(() => {})
+  }
+  setInterval(poll, 30_000)
+})()
+
+document.getElementById('saveContextGuardBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const id = currentAgent.autoRestartId || currentAgent.name
+  const cgEnabled = document.getElementById('cgEnabled')
+  const cgActPct = document.getElementById('cgActPct')
+  const cgHardPct = document.getElementById('cgHardPct')
+  const cgCooldownMinutes = document.getElementById('cgCooldownMinutes')
+  const cgHandoffTimeout = document.getElementById('cgHandoffTimeout')
+  const cgLimitTokensEl = document.getElementById('cgLimitTokens')
+
+  const actPct = Number(cgActPct.value) / 100
+  const hardPct = Number(cgHardPct.value) / 100
+  if (hardPct < actPct) {
+    showToast(t('agents.settings.ctx_guard_pct_hint'))
+    return
+  }
+
+  const limitTokensRaw = cgLimitTokensEl ? cgLimitTokensEl.value.trim() : ''
+  const cfg = {
+    enabled: cgEnabled.checked,
+    actPct,
+    hardPct,
+    cooldownMinutes: Number(cgCooldownMinutes.value) || 15,
+    handoffTimeoutMinutes: Number(cgHandoffTimeout.value) || 20,
+    limitTokens: limitTokensRaw ? Number(limitTokensRaw) : null,
+  }
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(id)}/context-guard`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    })
+    if (!res.ok) throw new Error()
+    showToast(t('agents.toast.ctx_guard_saved'))
+  } catch { showToast(t('common.error_save')) }
+})
+
 // Populate the idle-flush controls from an agent payload. Same source as
 // setupAutoRestartUI (the agent detail carries contextGuard alongside
 // autoRestart), so the settings pane needs no extra fetch.
@@ -3057,6 +3299,7 @@ async function openMarveenDetail() {
   // Reuse the agent detail modal for Marveen
   currentAgent = { ...m, name: mainAgentId(), claudeMd: '', soulMd: '', mcpJson: '', skills: [] }
   setupAutoRestartUI(currentAgent)
+  setupContextGuardUI(agentApiName())
   setupIdleFlushUI(currentAgent)
 
   const displayName = m.name || 'Marveen'
@@ -3288,6 +3531,7 @@ function renderAgents() {
           Terminal
         </button>
       </div>
+      <div class="agent-card-activity"></div>
     `
     mCard.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openTerminalModal(mainAgentId())
@@ -3295,11 +3539,16 @@ function renderAgents() {
     mCard.querySelector('.agent-conversation-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openConversationModal(mainAgentId(), t('agents.marveen_boss'))
     })
-    mCard.addEventListener('click', () => openMarveenDetail())
+    mCard.addEventListener('click', () => onAgentCardClick(mainAgentId(), openMarveenDetail))
     agentsGrid.insertBefore(mCard, addBtn)
   }
 
   for (const agent of agents) {
+    // Skip the main agent — it is already rendered as the dedicated Marveen
+    // card above (window._marveen block). Without this guard a second card
+    // appears once the agents/atlas/ config directory is created.
+    if (agent.name === mainAgentId()) continue
+
     // agent.name is the sanitized id (API/filesystem); displayName keeps the
     // original accented/cased input the user typed.
     const label = agent.displayName || agent.name
@@ -3350,6 +3599,7 @@ function renderAgents() {
           Terminal
         </button>
       </div>
+      <div class="agent-card-activity"></div>
     `
     // Login button handler (start → confirm flow)
     card.querySelectorAll('.agent-login-btn').forEach(btn => {
@@ -3363,7 +3613,7 @@ function renderAgents() {
     card.querySelector('.agent-conversation-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openConversationModal(agent.name, label)
     })
-    card.addEventListener('click', () => openAgentDetail(agent.name))
+    card.addEventListener('click', () => onAgentCardClick(agent.name, () => openAgentDetail(agent.name)))
     // Only running agents have a live session to look at, so only they get the
     // copy-the-tmux-command buttons.
     if (isRunning) attachTmuxCopyButtons(card, agent)
@@ -3384,6 +3634,14 @@ function renderAgents() {
 // endpoint. The main (Marveen) card matches on mainAgentId(); sub-agent cards
 // match on their data-name.
 let agentsBusyTimer = null
+// Last known 'working' ids from the poll below. Shared with the org chart so a
+// re-render (which rebuilds every node) keeps the active border instead of
+// blinking it off until the next 3s tick.
+let _workingAgentIds = new Set()
+// Ids whose tmux session is up. Decides whether an "Aktivitás"-mode card opens
+// the terminal on click, the same rule the Activity page used (a stopped agent
+// has no session to look at, so its card was not clickable).
+let _liveAgentIds = new Set()
 function startAgentsBusyPoll() {
   refreshAgentTerminalBusy()
   if (agentsBusyTimer) clearInterval(agentsBusyTimer)
@@ -3393,7 +3651,6 @@ function stopAgentsBusyPoll() {
   if (agentsBusyTimer) { clearInterval(agentsBusyTimer); agentsBusyTimer = null }
 }
 async function refreshAgentTerminalBusy() {
-  if (!agentsGrid) return
   let entries
   try {
     const res = await fetch('/api/agents/activity')
@@ -3401,15 +3658,39 @@ async function refreshAgentTerminalBusy() {
     entries = await res.json()
   } catch { return }
   if (!Array.isArray(entries)) return
-  const stateByName = new Map(entries.map((e) => [e.name, e.state]))
+  const byName = new Map(entries.filter((e) => e && e.name).map((e) => [e.name, e]))
+  _workingAgentIds = new Set(entries.filter((e) => e && e.state === 'working').map((e) => e.name))
+  _liveAgentIds = new Set(entries.filter((e) => e && e.running).map((e) => e.name))
   const mainId = mainAgentId()
-  agentsGrid.querySelectorAll('.agent-card:not(.add-card)').forEach((card) => {
-    const btn = card.querySelector('.agent-terminal-btn')
-    if (!btn) return
-    const id = card.classList.contains('marveen-card') ? mainId : card.dataset.name
-    const working = !!id && stateByName.get(id) === 'working'
-    btn.classList.toggle('agent-terminal-btn--busy', working)
-  })
+  if (agentsGrid) {
+    agentsGrid.querySelectorAll('.agent-card:not(.add-card):not(.federated-agent-card)').forEach((card) => {
+      const id = card.classList.contains('marveen-card') ? mainId : card.dataset.name
+      const entry = id ? byName.get(id) : null
+      const working = !!entry && entry.state === 'working'
+      const btn = card.querySelector('.agent-terminal-btn')
+      if (btn) btn.classList.toggle('agent-terminal-btn--busy', working)
+      // "Aktivitás" card mode: the live body plus the state colour and the
+      // clickable affordance. Written on every tick regardless of the current
+      // mode, so switching modes shows the current state instead of a blank
+      // card waiting for the next poll.
+      const body = card.querySelector('.agent-card-activity')
+      if (body) body.innerHTML = entry ? agentActivityBodyHtml(entry) : ''
+      const stateCls = entry ? (ACTIVITY_STATE_META[entry.state] || ACTIVITY_STATE_META.unknown).cls : 'act-unknown'
+      for (const meta of Object.values(ACTIVITY_STATE_META)) card.classList.remove(meta.cls)
+      card.classList.add(stateCls)
+      card.classList.toggle('agent-card-act-clickable', !!entry && !!entry.running)
+    })
+  }
+  // Org-chart view: same signal, painted as the node's border. Toggled in place
+  // rather than re-rendering, so an in-progress drag survives the tick.
+  // Scoped to #teamGraph on purpose -- the overview's mini graph is a snapshot
+  // and has no poll keeping it honest.
+  const treeGraph = document.getElementById('teamGraph')
+  if (treeGraph) {
+    treeGraph.querySelectorAll('.team-node[data-agent-id]').forEach((el) => {
+      el.classList.toggle('team-node-active', _workingAgentIds.has(el.dataset.agentId))
+    })
+  }
 }
 
 // Federated (remote-system) agents from the manifest-poller cache. Kept in a
@@ -3554,6 +3835,7 @@ async function openAgentDetail(agentName) {
 
   // Auto-restart settings + live context size
   setupAutoRestartUI(currentAgent)
+  setupContextGuardUI(currentAgent.autoRestartId || currentAgent.name)
   setupIdleFlushUI(currentAgent)
 
   // Telegram tab
@@ -4540,7 +4822,6 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
     mode: document.getElementById('arMode').value === 'fresh' ? 'fresh' : 'continue',
     dailyTime: schedKind === 'daily' ? document.getElementById('arDailyTime').value : null,
     intervalHours: schedKind === 'interval' ? Number(document.getElementById('arIntervalHours').value) : null,
-    handoff: false,
   }
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(id)}/auto-restart`, {
@@ -6870,10 +7151,41 @@ async function loadMemories() {
   try {
     const res = await fetch(`/api/memories?${params}`)
     const memories = await res.json()
+    // MEMKERESVAK917: the search is deliberately forgiving. When no row matches
+    // the query as asked, the endpoint drops those terms and answers with what
+    // the leftover filler words pulled in -- a body that looks exactly like a
+    // real hit. The difference rides the X-Memory-Search header, and reading it
+    // with res.json() alone threw it away, so a viewer saw fifty rescued rows
+    // as fifty hits. The header is only set on a search (q), not on listing.
+    renderMemSearchLabel(q ? res.headers.get('X-Memory-Search') : null)
     renderMemories(memories)
   } catch (err) {
     console.error('Memória betöltés hiba:', err)
   }
+}
+
+// Shown ONLY when the answer is a rescue. A banner on every search would be
+// noise the eye learns to skip, which is the same failure in a new costume.
+// Both header shapes are handled: the fts branch sends `strict=..; relaxed=..;
+// hits=..`, the hybrid branch (the dashboard default) sends `fts=..; vector=..;
+// relaxed=..; vector-only=..`.
+function renderMemSearchLabel(header) {
+  const el = document.getElementById('memSearchLabel')
+  if (!el) return
+  if (!header || !/relaxed=true/.test(header)) {
+    el.hidden = true
+    el.textContent = ''
+    return
+  }
+  el.hidden = false
+  el.textContent = ''
+  const strong = document.createElement('strong')
+  strong.textContent = t('memories.relaxed.title')
+  const body = document.createElement('div')
+  body.textContent = t('memories.relaxed.body')
+  const raw = document.createElement('code')
+  raw.textContent = header
+  el.append(strong, body, raw)
 }
 
 function renderMemories(memories) {
@@ -10947,7 +11259,10 @@ async function loadTeamGraph() {
     const res = await fetch('/api/team/graph')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
-    renderTeamGraph(container, data, { editable: true })
+    // Seed the active border from the last poll so it is right on first paint,
+    // then let the 3s agents-page poll keep it current.
+    renderTeamGraph(container, data, { editable: true, activeIds: _workingAgentIds })
+    if (agentsBusyTimer) refreshAgentTerminalBusy()
   } catch (err) {
     container.innerHTML = `<div class="team-empty">${t('team.error', { msg: err.message || err })}</div>`
   }
@@ -10980,6 +11295,7 @@ async function saveTeamReportsTo(childId, parentId, ctx) {
 
 function renderTeamGraph(container, data, opts = {}) {
   const editable = !!opts.editable
+  const activeIds = opts.activeIds instanceof Set ? opts.activeIds : new Set()
   const { nodes, edges, mainAgentId } = data
   container.innerHTML = ''
   const byId = new Map(nodes.map(n => [n.id, n]))
@@ -11012,7 +11328,15 @@ function renderTeamGraph(container, data, opts = {}) {
     if (node.role === 'main') div.classList.add('main')
     else if (node.role === 'leader') div.classList.add('leader')
     const roleLabel = node.role === 'main' ? t('team.role.main') : (node.role === 'leader' ? t('team.role.leader') : t('team.role.member'))
-    const running = node.running ? t('team.running') : t('team.stopped')
+    // Same pulsing dot the agent cards use, instead of the '●' that used to be
+    // baked into the translation -- a static glyph read as "stopped" next to a
+    // card whose dot was breathing.
+    const runLabel = node.running ? t('team.running') : t('team.stopped')
+    const runDotClass = node.running ? 'running' : 'stopped'
+    // Marked by refreshTeamGraphActivity() from /api/agents/activity, so the
+    // node carries its id for the class toggle that runs without a re-render.
+    div.dataset.agentId = node.id
+    if (activeIds.has(node.id)) div.classList.add('team-node-active')
     const avatarUrl = node.id === mainAgentId
       ? `/api/marveen/avatar${avatarBust()}`
       : `/api/agents/${encodeURIComponent(node.id)}/avatar${avatarBust()}`
@@ -11020,7 +11344,7 @@ function renderTeamGraph(container, data, opts = {}) {
       <div class="team-node-avatar"><img src="${avatarUrl}" alt="${escapeHtml(node.label || node.id)}" onerror="this.style.display='none'"></div>
       <div class="team-node-name">${escapeHtml(node.label || node.id)}</div>
       <div class="team-node-meta">${escapeHtml(roleLabel)}</div>
-      <div class="team-node-meta">${running}</div>
+      <div class="team-node-meta team-node-status"><span class="process-dot ${runDotClass}"></span>${escapeHtml(runLabel)}</div>
     `
     if (node.id !== mainAgentId) {
       div.addEventListener('click', () => openAgentDetail(node.id))
@@ -11129,30 +11453,49 @@ function renderTeamGraph(container, data, opts = {}) {
   }
 }
 
-// === Agents page: grid / org-chart view toggle ===
+// === Agents page: view toggle (cards / activity / org chart) ===
+// Three views, but only TWO layouts: 'grid' and 'activity' are the same card
+// grid with different card bodies ('grid' is the original card -- model badge,
+// run + channel status, actions; 'activity' replaces everything below the
+// avatar/name/description with the live pane status that used to be its own
+// Activity page), and 'tree' is the org chart. The card body follows from the
+// view, so the CSS keeps its data-card-mode hook without a second piece of
+// state to keep in sync.
 // Persists the chosen view for the session so navigating away and back keeps
 // the last selection. Defaults to 'grid'.
 let _agentsActiveView = 'grid'
 
-function _setAgentsView(view) {
-  _agentsActiveView = view
-  const gridView = document.getElementById('agentsGridView')
-  const treeView = document.getElementById('agentsTreeView')
-  const gridBtn  = document.getElementById('agentsViewGrid')
-  const treeBtn  = document.getElementById('agentsViewTree')
-  if (!gridView || !treeView) return
-  const showGrid = view === 'grid'
-  gridView.hidden = !showGrid
-  treeView.hidden = showGrid
-  if (gridBtn) gridBtn.classList.toggle('active', showGrid)
-  if (treeBtn) treeBtn.classList.toggle('active', !showGrid)
-  if (!showGrid) loadTeamGraph()
+// A card click means "open this agent" in card view and "look at what it is
+// doing" in activity view -- the same split the Activity page had, where only a
+// running agent's card was clickable.
+function onAgentCardClick(id, openDetail) {
+  if (_agentsActiveView === 'activity') {
+    if (id && _liveAgentIds.has(id)) openTerminalModal(id)
+    return
+  }
+  openDetail()
 }
 
-const _agentsViewGridBtn = document.getElementById('agentsViewGrid')
-const _agentsViewTreeBtn = document.getElementById('agentsViewTree')
-if (_agentsViewGridBtn) _agentsViewGridBtn.addEventListener('click', () => _setAgentsView('grid'))
-if (_agentsViewTreeBtn) _agentsViewTreeBtn.addEventListener('click', () => _setAgentsView('tree'))
+function _setAgentsView(view) {
+  _agentsActiveView = view === 'activity' || view === 'tree' ? view : 'grid'
+  const gridView = document.getElementById('agentsGridView')
+  const treeView = document.getElementById('agentsTreeView')
+  if (!gridView || !treeView) return
+  const showTree = _agentsActiveView === 'tree'
+  gridView.hidden = showTree
+  treeView.hidden = !showTree
+  if (agentsGrid) agentsGrid.dataset.cardMode = _agentsActiveView === 'activity' ? 'activity' : 'profile'
+  for (const btn of document.querySelectorAll('#agentsViewToggle [data-view]')) {
+    btn.classList.toggle('active', btn.dataset.view === _agentsActiveView)
+  }
+  // Repaint immediately rather than waiting up to 3s for the next tick.
+  if (!showTree && agentsBusyTimer) refreshAgentTerminalBusy()
+  if (showTree) loadTeamGraph()
+}
+
+for (const btn of document.querySelectorAll('#agentsViewToggle [data-view]')) {
+  btn.addEventListener('click', () => _setAgentsView(btn.dataset.view))
+}
 
 // === Team: inter-agent message log + compose ===
 // View the /api/messages queue and let the operator send a message to an agent
@@ -11686,6 +12029,88 @@ function formatRelative(ts) {
   return t('common.time.day_abbr', { n: day })
 }
 
+// Forward-looking duration, reusing the same abbreviations formatRelative uses
+// so the strip does not invent a second time vocabulary.
+function formatDurationShort(sec) {
+  if (sec < 60) return t('common.time.min_abbr', { n: 1 })
+  const min = Math.floor(sec / 60)
+  if (min < 60) return t('common.time.min_abbr', { n: min })
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return t('common.time.hour_abbr', { h: hr })
+  return t('common.time.day_abbr', { n: Math.floor(hr / 24) })
+}
+
+// Same thresholds as the status line's rl_pct(): >=80 danger, >=60 caution.
+// The dashboard palette has no yellow token, so the accent stands in for it.
+function quotaLevelClass(pct) {
+  if (pct >= 80) return 'danger'
+  if (pct >= 60) return 'warn'
+  return ''
+}
+
+// Render the subscription quota strip from /api/overview's `quota` block.
+//
+// The rule this follows: a quota reading is only worth showing while it is
+// fresh, and an absent strip must never look like a healthy one. So a missing
+// file still renders the strip -- with one quiet line saying why there is no
+// data -- and a stale or already-reset reading keeps its numbers but drops the
+// colour, because a green bar from six hours ago reassures exactly as much as
+// a green bar from six seconds ago.
+function renderQuotaStrip(q) {
+  const strip = document.getElementById('quotaStrip')
+  const bars = document.getElementById('quotaBars')
+  const note = document.getElementById('quotaStripNote')
+  const age = document.getElementById('quotaStripAge')
+  if (!strip || !bars || !note || !age) return
+  strip.hidden = false
+  bars.innerHTML = ''
+  note.hidden = true
+  note.className = 'quota-strip-note'
+  age.textContent = ''
+
+  if (!q || q.status === 'missing') {
+    const reason = q && q.reason ? q.reason : 'no-file'
+    note.textContent = t('overview.quota.none.' + reason.replace(/-/g, '_'))
+    note.hidden = false
+    return
+  }
+
+  const stale = q.status === 'stale'
+  const nowSec = Math.floor(Date.now() / 1000)
+  const windows = [
+    ['overview.quota.five_hour', q.fiveHour],
+    ['overview.quota.seven_day', q.sevenDay],
+  ]
+  for (const [labelKey, w] of windows) {
+    if (!w) continue
+    const pct = Math.max(0, Math.min(100, Math.round(w.usedPercentage)))
+    const muted = stale || w.expired
+    const row = document.createElement('div')
+    row.className = 'quota-bar' + (muted ? ' muted' : '')
+    let tail = ''
+    if (w.expired) {
+      tail = ' · ' + t('overview.quota.expired')
+    } else if (typeof w.resetsAt === 'number' && w.resetsAt > nowSec) {
+      tail = ' · ' + t('overview.quota.resets_in', { d: formatDurationShort(w.resetsAt - nowSec) })
+    }
+    row.innerHTML = `
+      <div class="quota-bar-label">${escapeHtml(t(labelKey))}</div>
+      <div class="quota-bar-track"><div class="quota-bar-fill ${muted ? '' : quotaLevelClass(pct)}" style="width:${pct}%"></div></div>
+      <div class="quota-bar-value">${pct}%<span class="quota-bar-reset">${escapeHtml(tail)}</span></div>
+    `
+    bars.appendChild(row)
+  }
+
+  if (typeof q.ageSec === 'number') {
+    age.textContent = t('overview.quota.measured', { age: formatRelative(Date.now() - q.ageSec * 1000) })
+  }
+  if (stale) {
+    note.textContent = t('overview.quota.stale')
+    note.className = 'quota-strip-note warn'
+    note.hidden = false
+  }
+}
+
 async function loadOverview() {
   try {
     const res = await fetch('/api/overview')
@@ -11701,6 +12126,7 @@ async function loadOverview() {
     document.getElementById('statMemoriesSub').textContent = `${t('overview.stat.sub.memories')} · ${d.memories.categories} category`
     document.getElementById('statSkills').textContent = d.skills.count
     document.getElementById('statSkillsSub').textContent = d.skills.today > 0 ? t('overview.stat.skills_today', { n: d.skills.today }) : ''
+    renderQuotaStrip(d.quota)
     // Team: reuse the hierarchy graph renderer so the overview card shows
     // exactly what the Csapat page does (avatars + reports-to tree).
     try {
@@ -13249,7 +13675,7 @@ window.addEventListener('beforeunload', (e) => {
 // entry never requires a frontend change just to render a sane heading.
 function settingsModuleLabel(mod) {
   const key = `settings.module.${mod}`
-  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true, channels: true, security: true, autonomy: true }
+  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true, channels: true, security: true, autonomy: true, 'claude-plans': true }
   return known[mod] ? t(key) : (mod.charAt(0).toUpperCase() + mod.slice(1))
 }
 
@@ -13344,6 +13770,21 @@ function renderBridgeEnrollSection(body) {
   document.getElementById('authBridgeEnrollBtn').addEventListener('click', bridgeEnrollFromUi)
 }
 
+// The pairing endpoint answers with a stable `code` beside its English
+// `error` sentence. Translate on the code, never on the sentence: the wording
+// is free to change, the code is the contract. An unknown code falls back to
+// the server's own sentence rather than to a blank line or a raw key, so a
+// server error added later degrades to English instead of disappearing.
+function bridgeEnrollErrorText(data) {
+  const code = data && typeof data.code === 'string' ? data.code : ''
+  if (code) {
+    const key = `auth.bridge.err.${code}`
+    const translated = t(key, (data && data.params) || {})
+    if (translated !== key) return translated
+  }
+  return (data && data.error) || t('auth.card.err_generic')
+}
+
 async function bridgeEnrollFromUi() {
   const msg = document.getElementById('authBridgeMsg')
   const out = document.getElementById('authBridgeBundle')
@@ -13363,7 +13804,7 @@ async function bridgeEnrollFromUi() {
       body: JSON.stringify(hostOverride ? { key_line: keyLine, name, host: hostOverride } : { key_line: keyLine, name }),
     })
     const data = await r.json().catch(() => ({}))
-    if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
+    if (!r.ok) { msg.classList.add('err'); msg.textContent = bridgeEnrollErrorText(data); return }
     msg.classList.add('ok')
     msg.textContent = (data.action === 'replaced' ? t('auth.bridge.repaired') : t('auth.bridge.paired')) +
       (data.warnings && data.warnings.length ? ` (${data.warnings.join('; ')})` : '')
@@ -13675,7 +14116,13 @@ async function loadSettings() {
     const securityDefs = byModule.get('security') ?? []
     byModule.delete('security')
 
-    const allModules = [...byModule.keys(), 'security', 'autonomy']
+    // module:'claude-plans' is just the CLAUDE_ROTATION_ENABLED toggle (PR2b)
+    // -- it renders below the plan-list widget in the synthetic Claude Plans
+    // tab, same pattern as securityDefs above.
+    const claudePlansDefs = byModule.get('claude-plans') ?? []
+    byModule.delete('claude-plans')
+
+    const allModules = [...byModule.keys(), 'security', 'autonomy', 'claude-plans']
     const savedTab = localStorage.getItem(SETTINGS_ACTIVE_TAB_KEY) || allModules[0]
     const activeTab = allModules.includes(savedTab) ? savedTab : allModules[0]
 
@@ -13782,6 +14229,45 @@ async function loadSettings() {
         renderAutonomyContent(grid, footer)
       }
     }
+
+    // Claude Plans tab (PR2b): synthetic like autonomy/security -- a hand-built
+    // plan-list + add-form widget, with the CLAUDE_ROTATION_ENABLED toggle
+    // (claudePlansDefs) appended below it exactly like security appends its
+    // registry keys after the auth card.
+    {
+      const mod = 'claude-plans'
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = settingsModuleLabel(mod)
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
+      const body = document.createElement('div')
+      body.className = 'settings-group'
+      body.id = 'claudePlansBody'
+      panel.appendChild(body)
+
+      if (claudePlansDefs.length) {
+        const group = document.createElement('div')
+        group.className = 'settings-group'
+        for (const def of claudePlansDefs) {
+          group.appendChild(buildSettingRow(def))
+        }
+        panel.appendChild(group)
+      }
+
+      tabPanels.appendChild(panel)
+
+      if (mod === activeTab) {
+        renderClaudePlansPanel(body)
+      }
+    }
   } catch (err) {
     tabPanels.innerHTML = `<p style="padding:24px;color:var(--danger)">${t('settings.error')}</p>`
   }
@@ -13800,6 +14286,169 @@ function activateSettingsTab(mod) {
     const grid = document.getElementById('settingsAutonomyGrid')
     const footer = document.getElementById('settingsAutonomyUpdatedAt')
     if (grid && !grid.innerHTML.trim()) renderAutonomyContent(grid, footer)
+  }
+
+  if (mod === 'claude-plans') {
+    const body = document.getElementById('claudePlansBody')
+    if (body && !body.innerHTML.trim()) renderClaudePlansPanel(body)
+  }
+}
+
+// Claude Plans tab (PR2b): plan-list + add-form widget over
+// store/claude-plans.json, plus GET /api/claude-plans/state for the
+// active-plan / last-known-usage badges. The "active" dot reflects the MAIN
+// agent's entry in activePlanByAgent (PR2c, design decision #1: the state is
+// per-agent, but this tab only shows the one that also drives the dashboard
+// header). There is still no manual rotate button here: this tab lets the
+// operator view and hand-edit the registry, the same way it already lets
+// them for store/claude-plans.json by hand; actual rotation is triggered by
+// the heartbeat script or POST /api/claude-plans/rotate directly.
+async function renderClaudePlansPanel(body) {
+  body.innerHTML = `
+    <p style="color:var(--text-muted);font-size:13px;margin:0 0 16px">${t('settings.claude_plans.intro')}</p>
+    <div id="claudePlansList"></div>
+    <div class="claude-plans-add-form">
+      <div class="form-row">
+        <div class="form-group" style="flex:1">
+          <label>${t('settings.claude_plans.form.id')}</label>
+          <input class="input" id="cpFormId" placeholder="personal-2">
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>${t('settings.claude_plans.form.label')}</label>
+          <input class="input" id="cpFormLabel" placeholder="Second Pro">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="flex:2">
+          <label>${t('settings.claude_plans.form.config_dir')}</label>
+          <input class="input" id="cpFormConfigDir" placeholder="~/.claude-second">
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>${t('settings.claude_plans.form.type')}</label>
+          <select class="input" id="cpFormType">
+            <option value="personal">${t('settings.claude_plans.form.type_personal')}</option>
+            <option value="team">${t('settings.claude_plans.form.type_team')}</option>
+          </select>
+        </div>
+      </div>
+      <label class="claude-plans-checkbox-row">
+        <input type="checkbox" id="cpFormChannelsAllowed" checked>
+        <span>${t('settings.claude_plans.form.channels_allowed')}</span>
+      </label>
+      <div id="cpFormError" class="settings-row-error" hidden></div>
+      <button class="btn-secondary btn-compact" id="cpFormAddBtn" style="margin-top:12px">${t('settings.claude_plans.form.add_btn')}</button>
+    </div>
+  `
+
+  document.getElementById('cpFormAddBtn').addEventListener('click', () => addClaudePlan())
+  for (const id of ['cpFormId', 'cpFormLabel', 'cpFormConfigDir']) {
+    document.getElementById(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') addClaudePlan() })
+  }
+
+  await loadClaudePlansList()
+}
+
+async function addClaudePlan() {
+  const errEl = document.getElementById('cpFormError')
+  errEl.hidden = true
+  const id = document.getElementById('cpFormId').value.trim()
+  const label = document.getElementById('cpFormLabel').value.trim()
+  const configDir = document.getElementById('cpFormConfigDir').value.trim()
+  const planType = document.getElementById('cpFormType').value
+  const channelsAllowed = document.getElementById('cpFormChannelsAllowed').checked
+
+  if (!id || !label || !configDir) {
+    errEl.textContent = t('settings.claude_plans.form.error_required')
+    errEl.hidden = false
+    return
+  }
+
+  try {
+    const res = await fetch('/api/claude-plans', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, label, configDir, planType, channelsAllowed }),
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      errEl.textContent = data.error || t('settings.claude_plans.form.error_generic')
+      errEl.hidden = false
+      return
+    }
+    document.getElementById('cpFormId').value = ''
+    document.getElementById('cpFormLabel').value = ''
+    document.getElementById('cpFormConfigDir').value = ''
+    document.getElementById('cpFormChannelsAllowed').checked = true
+    await loadClaudePlansList()
+  } catch {
+    errEl.textContent = t('settings.claude_plans.form.error_generic')
+    errEl.hidden = false
+  }
+}
+
+async function deleteClaudePlan(id) {
+  if (!confirm(t('settings.claude_plans.confirm_delete', { id }))) return
+  await fetch(`/api/claude-plans/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  await loadClaudePlansList()
+}
+
+async function loadClaudePlansList() {
+  const list = document.getElementById('claudePlansList')
+  if (!list) return
+  list.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('common.loading')}</p>`
+  try {
+    const [plansRes, stateRes] = await Promise.all([
+      fetch('/api/claude-plans'),
+      fetch('/api/claude-plans/state'),
+    ])
+    const plans = plansRes.ok ? await plansRes.json() : []
+    const state = stateRes.ok ? await stateRes.json() : { activePlanByAgent: {}, plans: {} }
+
+    if (!plans.length) {
+      list.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.claude_plans.empty')}</p>`
+      return
+    }
+
+    list.innerHTML = ''
+    for (const plan of plans) {
+      const observed = state.plans?.[plan.id]
+      const fiveHour = observed?.windows?.five_hour
+      const isActive = state.activePlanByAgent?.[mainAgentId()] === plan.id
+
+      const row = document.createElement('div')
+      row.className = 'claude-plan-row'
+
+      const main = document.createElement('div')
+      main.style.flex = '1'
+      const mainLine = document.createElement('div')
+      mainLine.className = 'claude-plan-row-main'
+      mainLine.innerHTML = `
+        ${isActive ? `<span class="claude-plan-active-dot" title="${t('settings.claude_plans.active')}"></span>` : ''}
+        <strong>${escapeHtml(plan.label)}</strong>
+        <span class="claude-plan-badge">${plan.planType === 'team' ? t('settings.claude_plans.form.type_team') : t('settings.claude_plans.form.type_personal')}</span>
+        ${!plan.channelsAllowed ? `<span class="claude-plan-badge claude-plan-badge-muted">${t('settings.claude_plans.no_channels')}</span>` : ''}
+        ${fiveHour ? `<span class="claude-plan-badge">${t('settings.claude_plans.last_known', { pct: Math.round(fiveHour.usedPercent) })}</span>` : ''}
+      `
+      main.appendChild(mainLine)
+
+      const meta = document.createElement('div')
+      meta.className = 'claude-plan-row-meta'
+      meta.textContent = `${plan.id} · ${plan.configDir}`
+      main.appendChild(meta)
+
+      row.appendChild(main)
+
+      const delBtn = document.createElement('button')
+      delBtn.className = 'claude-plan-delete'
+      delBtn.title = t('common.btn.delete')
+      delBtn.textContent = '×'
+      delBtn.addEventListener('click', () => deleteClaudePlan(plan.id))
+      row.appendChild(delBtn)
+
+      list.appendChild(row)
+    }
+  } catch {
+    list.innerHTML = `<p style="color:var(--danger);font-size:13px">${t('settings.error')}</p>`
   }
 }
 
@@ -15025,6 +15674,13 @@ let ideasAll = []
 let ideasPromoteId = null
 let ideaEditId = null
 let ideaDetailId = null
+const IDEA_SCOPE_STORAGE_KEY = 'ideas-scope-filter'
+let ideaScope = (() => {
+  try {
+    const saved = localStorage.getItem(IDEA_SCOPE_STORAGE_KEY)
+    return ['munka', 'szemelyes', 'all'].includes(saved) ? saved : 'munka'
+  } catch { return 'munka' }
+})()
 const STATUS_COLORS = { new: 'var(--accent)', reviewed: '#f59e0b', kanban: '#22c55e', rejected: '#ef4444' }
 const STATUS_LABELS = { new: () => t('ideas.status.new'), reviewed: () => t('ideas.status.reviewed'), kanban: () => t('ideas.status.kanban'), rejected: () => t('ideas.status.rejected') }
 
@@ -15037,6 +15693,7 @@ async function loadIdeasPage() {
   // first promote the "Kanbanban" box showed 0 with the item hidden, which read
   // as data loss on the first live promote (2026-08-20).
   if (categoryFilter) params.set('category', categoryFilter)
+  if (ideaScope !== 'all') params.set('scope', ideaScope)
   const [ideasRes, catsRes] = await Promise.all([fetch('/api/ideas?' + params), fetch('/api/ideas/categories')])
   ideasAll = await ideasRes.json()
   if (statusFilter === 'active') ideas = ideasAll.filter(i => i.status === 'new' || i.status === 'reviewed')
@@ -15050,7 +15707,48 @@ async function loadIdeasPage() {
   }
   renderIdeasStats()
   renderIdeasList()
+  document.querySelectorAll('#ideaScopeFilter [data-scope]').forEach(button => button.classList.toggle('active', button.dataset.scope === ideaScope))
 }
+
+document.getElementById('ideaUploadInput')?.addEventListener('change', async (event) => {
+  const input = event.target
+  const files = Array.from(input.files || [])
+  const button = document.getElementById('ideaUploadBtn')
+  let uploaded = 0
+  const failures = []
+  input.disabled = true
+  button.disabled = true
+  try {
+    for (const file of files) {
+      button.textContent = t('ideas.upload.uploading', { name: file.name })
+      const form = new FormData()
+      form.append('file', file)
+      form.append('scope', ideaScope === 'all' ? 'munka' : ideaScope)
+      try {
+        const res = await fetch('/api/ideas/upload', { method: 'POST', body: form })
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}))
+          throw new Error(data.error || t('ideas.upload.error'))
+        }
+        uploaded++
+      } catch (err) {
+        failures.push(`${file.name}: ${err.message || t('ideas.upload.error')}`)
+      }
+    }
+    if (files.length) {
+      const summary = t('ideas.upload.summary', { uploaded, failed: failures.length })
+      showToast(failures.length ? `${summary} (${failures.join('; ')})` : summary, failures.length ? 'error' : undefined)
+      await loadIdeasPage()
+    }
+  } finally {
+    input.value = ''
+    input.disabled = false
+    button.disabled = false
+    button.textContent = t('ideas.upload.button')
+  }
+})
+
+document.getElementById('ideaUploadBtn')?.addEventListener('click', () => document.getElementById('ideaUploadInput')?.click())
 
 function renderIdeasStats() {
   const counts = { new: 0, reviewed: 0, kanban: 0, rejected: 0 }
@@ -15118,7 +15816,7 @@ function renderIdeaCard(idea) {
 
 function applyIdeaModalI18n() {
   const labels = document.querySelectorAll('#ideaModalOverlay .form-label')
-  const keys = ['ideas.modal.title_label', 'ideas.modal.desc_label', 'ideas.modal.category_label', 'ideas.modal.impact_label', 'ideas.modal.effort_label']
+  const keys = ['ideas.modal.title_label', 'ideas.modal.desc_label', 'ideas.scope.label', 'ideas.modal.category_label', 'ideas.modal.impact_label', 'ideas.modal.effort_label']
   labels.forEach((el, i) => { if (keys[i]) el.textContent = t(keys[i]) })
   const saveBtn = document.getElementById('ideaModalSave')
   const cancelBtn = document.getElementById('ideaModalCancel')
@@ -15131,6 +15829,7 @@ function openIdeaNew() {
   document.getElementById('ideaModalTitle').textContent = t('ideas.modal.title_new')
   document.getElementById('ideaTitleInput').value = ''
   document.getElementById('ideaDescInput').value = ''
+  document.getElementById('ideaScopeInput').value = ideaScope === 'all' ? 'munka' : ideaScope
   applyIdeaModalI18n()
   openModal(document.getElementById('ideaModalOverlay'))
 }
@@ -15143,6 +15842,7 @@ function openIdeaEdit(id) {
   document.getElementById('ideaTitleInput').value = idea.title
   document.getElementById('ideaDescInput').value = idea.description || ''
   document.getElementById('ideaCategoryInput').value = idea.category
+  document.getElementById('ideaScopeInput').value = idea.scope
   document.getElementById('ideaImpactInput').value = idea.impact ?? ''
   document.getElementById('ideaEffortInput').value = idea.effort ?? ''
   openModal(document.getElementById('ideaModalOverlay'))
@@ -15157,6 +15857,7 @@ async function saveIdea() {
     title,
     description: document.getElementById('ideaDescInput').value.trim() || undefined,
     category: document.getElementById('ideaCategoryInput').value,
+    scope: document.getElementById('ideaScopeInput').value,
     source: 'manual',
     impact: impactRaw ? parseInt(impactRaw) : null,
     effort: effortRaw ? parseInt(effortRaw) : null,
@@ -15186,13 +15887,90 @@ async function openIdeaDetail(id) {
   document.getElementById('ideaDetailTitle').textContent = idea.title
   document.getElementById('ideaDetailMeta').textContent = `${idea.category} · ${statusLabel}`
   document.getElementById('ideaDetailDesc').textContent = idea.description || t('ideas.no_description')
+  const otherScope = idea.scope === 'munka' ? 'szemelyes' : 'munka'
+  document.getElementById('ideaDetailScope').textContent = t('ideas.scope.current', { scope: t(`ideas.scope.${idea.scope}`) })
+  document.getElementById('ideaDetailScopeMove').textContent = t('ideas.scope.move', { scope: t(`ideas.scope.${otherScope}`) })
+  document.getElementById('ideaDetailScopeMove').dataset.scope = otherScope
   document.getElementById('ideaDetailImpact').value = idea.impact ?? ''
   document.getElementById('ideaDetailEffort').value = idea.effort ?? ''
   updateDetailScoreChip()
   document.getElementById('ideaCommentsList').innerHTML = ''
+  document.getElementById('ideaAttachmentsList').innerHTML = ''
+  document.getElementById('ideaAttachmentStatus').style.display = 'none'
   document.getElementById('ideaCommentContent').value = ''
   openModal(document.getElementById('ideaDetailOverlay'))
-  await loadIdeaComments(id)
+  await Promise.all([loadIdeaComments(id), loadIdeaAttachments(id)])
+}
+
+function formatIdeaAttachmentSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+async function loadIdeaAttachments(id) {
+  const list = document.getElementById('ideaAttachmentsList')
+  try {
+    const res = await fetch(`/api/ideas/${encodeURIComponent(id)}/attachments`)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const data = await res.json()
+    if (!data.attachments || !data.attachments.length) {
+      list.innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:3px 0">${t('ideas.detail.attach.empty')}</div>`
+      return
+    }
+    list.innerHTML = data.attachments.map(a => `
+      <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--border)">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(a.filename)}">${escapeHtml(a.filename)}</div>
+          <div style="font-size:11px;color:var(--text-muted)">${formatIdeaAttachmentSize(a.size)}${a.has_text ? ` · <span title="${t('ideas.detail.attach.has_text')}" style="color:var(--success)">✓ ${t('ideas.detail.attach.text_marker')}</span>` : ''}</div>
+        </div>
+        <a class="btn-secondary btn-compact" style="font-size:11px;text-decoration:none" href="/api/ideas/attachments/${encodeURIComponent(a.id)}/download">${t('ideas.detail.attach.download')}</a>
+        <button class="btn-secondary btn-compact" style="font-size:11px;color:var(--danger)" onclick="deleteIdeaAttachmentItem('${encodeURIComponent(a.id)}')">${t('ideas.detail.attach.delete')}</button>
+      </div>`).join('')
+  } catch {
+    list.innerHTML = `<div style="color:var(--danger);font-size:12px">${t('ideas.detail.attach.load_error')}</div>`
+  }
+}
+
+document.getElementById('ideaAttachmentInput')?.addEventListener('change', async (event) => {
+  if (!ideaDetailId) return
+  const input = event.target
+  const files = Array.from(input.files || [])
+  const label = document.getElementById('ideaAttachmentUploadLabel')
+  const status = document.getElementById('ideaAttachmentStatus')
+  input.disabled = true
+  label.style.opacity = '0.6'
+  status.style.display = ''
+  try {
+    for (const file of files) {
+      status.textContent = t('ideas.detail.attach.uploading', { name: file.name })
+      const form = new FormData()
+      form.append('file', file)
+      const res = await fetch(`/api/ideas/${encodeURIComponent(ideaDetailId)}/attachments`, { method: 'POST', body: form })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || t('ideas.detail.attach.upload_error'))
+      }
+    }
+    if (files.length) showToast(t('ideas.detail.attach.uploaded'))
+    await loadIdeaAttachments(ideaDetailId)
+  } catch (err) {
+    showToast(err.message || t('ideas.detail.attach.upload_error'), 'error')
+  } finally {
+    input.value = ''
+    input.disabled = false
+    label.style.opacity = ''
+    status.style.display = 'none'
+  }
+})
+
+async function deleteIdeaAttachmentItem(encodedId) {
+  if (!confirm(t('ideas.detail.attach.confirm_delete'))) return
+  try {
+    const res = await fetch(`/api/ideas/attachments/${encodedId}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    if (ideaDetailId) await loadIdeaAttachments(ideaDetailId)
+  } catch { showToast(t('ideas.detail.attach.delete_error'), 'error') }
 }
 
 function updateDetailScoreChip() {
@@ -15281,6 +16059,18 @@ document.getElementById('ideaDetailEditBtn')?.addEventListener('click', () => {
   closeModal(document.getElementById('ideaDetailOverlay'))
   openIdeaEdit(ideaDetailId)
 })
+document.getElementById('ideaDetailScopeMove')?.addEventListener('click', async (event) => {
+  if (!ideaDetailId) return
+  const scope = event.currentTarget.dataset.scope
+  try {
+    const res = await fetch(`/api/ideas/${encodeURIComponent(ideaDetailId)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scope }),
+    })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    closeModal(document.getElementById('ideaDetailOverlay'))
+    await loadIdeasPage()
+  } catch { showToast(t('ideas.scope.move_error'), 'error') }
+})
 
 function openIdeaPromote(id) {
   ideasPromoteId = id
@@ -15344,6 +16134,13 @@ document.getElementById('ideaPromoteDetail')?.addEventListener('click', () => pr
 document.getElementById('ideaPromotePlan')?.addEventListener('click', () => promoteIdea('plan'))
 document.getElementById('ideaStatusFilter')?.addEventListener('change', loadIdeasPage)
 document.getElementById('ideaCategoryFilter')?.addEventListener('change', loadIdeasPage)
+document.getElementById('ideaScopeFilter')?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-scope]')
+  if (!button) return
+  ideaScope = button.dataset.scope
+  try { localStorage.setItem(IDEA_SCOPE_STORAGE_KEY, ideaScope) } catch { /* storage blocked */ }
+  loadIdeasPage()
+})
 
 
 // === Agent reauth login flow ===
