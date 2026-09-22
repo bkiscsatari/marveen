@@ -18,6 +18,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { writePrivateFile } from './private-file.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
@@ -111,9 +112,23 @@ export function buildHeadlessEnv(i: HeadlessEnvInputs): NodeJS.ProcessEnv {
       env.CLAUDE_CODE_OAUTH_TOKEN = i.oauthToken
     }
   } else {
-    Object.assign(env, resolveProviderEnvVars(i.spec.model, i.secretLookup))
+    // A third-party Anthropic-compatible endpoint gets ITS key and nothing of
+    // ours: an inherited CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY next to a
+    // foreign ANTHROPIC_BASE_URL could be sent to that vendor.
+    delete env.CLAUDE_CODE_OAUTH_TOKEN; delete env.ANTHROPIC_API_KEY; delete env.ANTHROPIC_AUTH_TOKEN
+    const vars = resolveProviderEnvVars(i.spec.model, i.secretLookup)
+    if ('ANTHROPIC_AUTH_TOKEN' in vars && !vars.ANTHROPIC_AUTH_TOKEN) throw new MissingProviderKeyError(i.spec.provider)
+    Object.assign(env, vars)
   }
   return env
+}
+
+/** No vault key for a provider that needs one: reported as an auth block, never run with an empty token. */
+export class MissingProviderKeyError extends Error {
+  constructor(public readonly provider: string) {
+    super(`auth: no API key in the vault for provider ${provider}`)
+    this.name = 'MissingProviderKeyError'
+  }
 }
 
 /** Fleet OAuth token precedence: process env > .env line > store/.claude-oauth-token. */
@@ -214,7 +229,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onR
     let base: Record<string, unknown> = {}
     try { base = (JSON.parse(readFileSync(mcpConfigPath, 'utf-8')) as { mcpServers?: Record<string, unknown> }).mcpServers ?? {} } catch { base = {} }
     const merged = join(configDir, `mcp-${spec.id.replace(/[^A-Za-z0-9_-]/g, '_')}.json`)
-    writeFileSync(merged, JSON.stringify({ mcpServers: { ...base, ...spec.extraMcpServers } }, null, 2) + '\n', { mode: 0o600 })
+    writePrivateFile(merged, JSON.stringify({ mcpServers: { ...base, ...spec.extraMcpServers } }, null, 2) + '\n')
     mcpConfigPath = merged
   }
   const cwd = opts.cwd ?? spec.dir
@@ -225,10 +240,16 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onR
     mcpConfigPath,
     strictMcp: true,
   })
-  const env = buildHeadlessEnv({
-    spec, configDir, oauthToken: resolveFleetOauthToken(), secretLookup,
-    base: { ...process.env, ...(opts.env ?? {}) },
-  })
+  let env: NodeJS.ProcessEnv
+  try {
+    env = buildHeadlessEnv({
+      spec, configDir, oauthToken: resolveFleetOauthToken(), secretLookup,
+      base: { ...process.env, ...(opts.env ?? {}) },
+    })
+  } catch (err) {
+    if (err instanceof MissingProviderKeyError) return { text: null, blocked: true, reason: err.message }
+    throw err
+  }
   const timeoutMs = opts.timeoutMs ?? DEFAULT_HEADLESS_TIMEOUT_MS
   const startedAt = Date.now()
   const acc = new ClaudeStreamAccumulator({ onText: opts.onProgress })

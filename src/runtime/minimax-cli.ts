@@ -22,6 +22,7 @@
 
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { writePrivateFile } from './private-file.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
@@ -174,7 +175,7 @@ export function prepareMinimaxBundle(spec: AgentSpec, opts: { permissionMode?: '
     const merged = { ...base }
     let changed = false
     for (const [k, v] of Object.entries(spec.extraMcpServers)) if (JSON.stringify(merged[k]) !== JSON.stringify(v)) { merged[k] = v as McpServerDef; changed = true }
-    if (changed) writeFileSync(mcpPath, JSON.stringify({ mcpServers: merged }, null, 2) + '\n')
+    if (changed) writePrivateFile(mcpPath, JSON.stringify({ mcpServers: merged }, null, 2) + '\n')
   }
 
   // Hooks plugin.

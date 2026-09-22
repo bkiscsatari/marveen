@@ -117,7 +117,7 @@ export function resolveProviderEnv(
       const key = firstSecret(providerSecretIds('deepseek'), secretLookup)
       return {
         provider: 'deepseek',
-        exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=${ENDPOINTS.deepseek} && export ANTHROPIC_MODEL=${modelQ} && `,
+        exportsStr: `export ANTHROPIC_AUTH_TOKEN=${shSingleQuote(key)} && export ANTHROPIC_BASE_URL=${ENDPOINTS.deepseek} && export ANTHROPIC_MODEL=${modelQ} && `,
       }
     }
     case 'minimax': {
@@ -130,28 +130,28 @@ export function resolveProviderEnv(
       // minimax- rule in context-guard.ts -- change both or neither.
       return {
         provider: 'minimax',
-        exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=${ENDPOINTS.minimax} && export ANTHROPIC_MODEL=${modelQ} && export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 && `,
+        exportsStr: `export ANTHROPIC_AUTH_TOKEN=${shSingleQuote(key)} && export ANTHROPIC_BASE_URL=${ENDPOINTS.minimax} && export ANTHROPIC_MODEL=${modelQ} && export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 && `,
       }
     }
     case 'moonshot': {
       const key = firstSecret(providerSecretIds('moonshot'), secretLookup)
       return {
         provider: 'moonshot',
-        exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=${ENDPOINTS.moonshot} && export ANTHROPIC_MODEL=${modelQ} && `,
+        exportsStr: `export ANTHROPIC_AUTH_TOKEN=${shSingleQuote(key)} && export ANTHROPIC_BASE_URL=${ENDPOINTS.moonshot} && export ANTHROPIC_MODEL=${modelQ} && `,
       }
     }
     case 'zhipu': {
       const key = firstSecret(providerSecretIds('zhipu'), secretLookup)
       return {
         provider: 'zhipu',
-        exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=${ENDPOINTS.zhipu} && export ANTHROPIC_MODEL=${modelQ} && `,
+        exportsStr: `export ANTHROPIC_AUTH_TOKEN=${shSingleQuote(key)} && export ANTHROPIC_BASE_URL=${ENDPOINTS.zhipu} && export ANTHROPIC_MODEL=${modelQ} && `,
       }
     }
     case 'openrouter': {
       const key = firstSecret(providerSecretIds('openrouter'), secretLookup)
       return {
         provider: 'openrouter',
-        exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=${ENDPOINTS.openrouter} && export ANTHROPIC_MODEL=${modelQ} && `,
+        exportsStr: `export ANTHROPIC_AUTH_TOKEN=${shSingleQuote(key)} && export ANTHROPIC_BASE_URL=${ENDPOINTS.openrouter} && export ANTHROPIC_MODEL=${modelQ} && `,
       }
     }
     case 'ollama':

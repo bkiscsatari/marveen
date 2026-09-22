@@ -14,7 +14,7 @@ describe('anthropic-compat-env (moved from agent-process.ts in Phase 0)', () => 
     expect(r.provider).toBe('moonshot')
     expect(seen).toEqual(['MOONSHOT_API_KEY'])
     expect(r.exportsStr).toContain('ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic')
-    expect(r.exportsStr).toContain('ANTHROPIC_AUTH_TOKEN="ms-secret"')
+    expect(r.exportsStr).toContain("ANTHROPIC_AUTH_TOKEN='ms-secret'")
     expect(r.exportsStr).toContain(`ANTHROPIC_MODEL='kimi-k3'`)
   })
 
@@ -26,7 +26,7 @@ describe('anthropic-compat-env (moved from agent-process.ts in Phase 0)', () => 
 
   it('falls through the alias chain: canonical id found when the legacy id is absent', () => {
     const r = resolveProviderEnv('deepseek-v4-pro', (id) => (id === 'provider:deepseek:api-key' ? 'canon' : null))
-    expect(r.exportsStr).toContain('ANTHROPIC_AUTH_TOKEN="canon"')
+    expect(r.exportsStr).toContain("ANTHROPIC_AUTH_TOKEN='canon'")
   })
 
   it('openai / google have NO Anthropic-compatible endpoint: empty chain, provider "unsupported"', () => {

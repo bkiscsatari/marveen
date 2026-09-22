@@ -7,6 +7,7 @@ import {
   headlessHomeFor,
   claudeHeadlessRuntime,
   HEADLESS_DISALLOWED_TOOLS,
+  MissingProviderKeyError,
 } from '../runtime/claude-headless.js'
 import { resolveProviderEnvVars } from '../runtime/anthropic-compat-env.js'
 import { bgRuntimeKind, isRuntimeBackedSession, runtimeSessionRef } from '../web/routes/background-tasks.js'
@@ -79,6 +80,15 @@ describe('buildHeadlessEnv', () => {
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('ds')
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic')
     expect(env.ANTHROPIC_MODEL).toBe('deepseek-v4-pro')
+    // Our Anthropic credentials must not ride along to a third-party endpoint.
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined()
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+  })
+  it('a third-party provider without a vault key is refused, never run with an empty token', () => {
+    expect(() => buildHeadlessEnv({
+      spec: { id: 'a', model: 'deepseek-v4-pro', provider: 'deepseek', authMode: 'api' },
+      configDir: '/cfg', oauthToken: 'fleet-tok', secretLookup: () => null, base: { ...base, ANTHROPIC_API_KEY: 'sk-ant' },
+    })).toThrow(MissingProviderKeyError)
   })
 })
 

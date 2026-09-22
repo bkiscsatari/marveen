@@ -20,6 +20,7 @@
 
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, lstatSync } from 'node:fs'
+import { writePrivateFile } from './private-file.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
@@ -159,12 +160,12 @@ export function prepareCodexBundle(spec: AgentSpec, opts: { permissionMode?: 'pe
     skippedHooks = r.skipped
     mkdirSync(join(dir, '.codex'), { recursive: true })
     hooksPath = join(dir, '.codex', 'hooks.json')
-    writeFileSync(hooksPath, JSON.stringify(r.file, null, 2) + '\n')
+    writePrivateFile(hooksPath, JSON.stringify(r.file, null, 2) + '\n')
   }
 
   // config.toml
   const configPath = join(codexHome, 'config.toml')
-  writeFileSync(configPath, renderCodexConfigToml({
+  writePrivateFile(configPath, renderCodexConfigToml({
     model: spec.model,
     sandboxMode: sandboxForProfile(spec.securityProfile, opts.permissionMode),
     networkAccess: true,
@@ -173,7 +174,7 @@ export function prepareCodexBundle(spec: AgentSpec, opts: { permissionMode?: 'pe
     hooksEnabled,
     modelContextWindow: undefined,
     mcpServers: mcp,
-  }))
+  })) // MCP env blocks may carry keys: owner-only
 
   // Login seed: subscription auth lives in ~/.codex/auth.json (codex login);
   // link it into the isolated home so every agent shares the owner's login

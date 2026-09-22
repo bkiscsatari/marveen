@@ -18,6 +18,7 @@
 
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { writePrivateFile } from './private-file.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
@@ -106,7 +107,7 @@ export function prepareGeminiBundle(spec: AgentSpec, opts: { hooksEnabled?: bool
   const shim = `${process.execPath} ${join(PROJECT_ROOT, 'scripts', 'hooks', 'shim', 'gemini-hook.mjs')}`
   const r = renderGeminiSettings({ mcpServers: mcp, claudeHooks: hooksEnabled ? settings?.hooks ?? null : null, shimCommand: shim })
   const settingsPath = join(dir, '.gemini', 'settings.json')
-  writeFileSync(settingsPath, JSON.stringify(r.settings, null, 2) + '\n')
+  writePrivateFile(settingsPath, JSON.stringify(r.settings, null, 2) + '\n') // MCP env blocks may carry keys: owner-only
   return { settingsPath, geminiMdPath, skippedHooks: r.skipped }
 }
 
