@@ -180,3 +180,13 @@ Ellenőrzés a klónban: `tsc` tiszta; vitest 507 fájl — a 3 maradó piros k�
 **Élő próba (owner-teendő):** Scout → „MiniMax M3 (előfizetés)” a kártyán → restart → kanban-kártya vagy Icuka-üzenet → a „Napló” gombon a kör; `token_usage` sor `runtime='minimax-cli'`.
 
 **Élőben ellenőrizve (2026-09-22 21:31, dev-klón 3421-es porton, éles érintetlen):** Scout `minimax-cli`/`minimax-m3` előfizetésen a dashboard API-n át indítva; Icuka inter-agent üzenete a routeren keresztül kézbesítve (`delivered`), 25 mp alatt lefutott a kör, Scout a dashboard API-n válaszolt (`agent_messages` #2 → icukadev), `token_usage` sor `runtime='minimax-cli'` (46 809 be / 1 907 ki token), a resume-token a `store/headless-agents.json`-ban, hookok natívan (`hooks: native`), a kártya-API `headless: true`, `runtimeState: idle`. Tanulság a klón-tesztekhez: a `WEB_PORT` CSAK a `.env` fájlból olvasódik (env-változó nem elég), és a dashboard port-lockja leállítja a port másik node-birtokosát -- egy 3420-ra tévedt dev-példány 5 percre leállította az éles dashboardot (visszaindítva; `Restart=on-failure` miatt nem jött vissza magától). A `h4_live.sh` azóta a feloldott portot ellenőrzi indítás előtt.
+
+### Phase 8 utólagos javítások (2026-09-22 este, mind élesben)
+- `511e3e6` headless start kilövi a régi tmux-pane-t (váltáskor a régi Claude-TUI Scout futva maradt); visszaváltásnál a loop-bejegyzés ejtve.
+- `4bc6218` a „Napló/Terminál” gomb-elágazás tévedésből a fő-agent kártyájába került → `agent is not defined`, üres Csapat-oldal; javítva, a sub-agent kártyán van.
+- `1ec2baa` headless kártyán nincs „⧉tmux” gomb.
+- Élő állapot: Scout `minimax-cli`/`minimax-m3` előfizetésen, Icuka tesztfeladatát megválaszolta (#2460→#2461), dashboard-restart után a reconciler 30 mp alatt visszahozza a loopot a folytatási tokennel.
+- Dashboard-tudnivalók: az oldal (`/`) 24 órás cache-fejlécet kap → deploy után Ctrl+Shift+R kell; egy 401 törli a böngészőben tárolt tokent → `http://localhost:3420/?token=<store/.dashboard-token>` visszaírja.
+- Klón-tesztek: a vitest live-install gate a `store/.dashboard-token` és `store/claudeclaw.db` létére bukik → dev-dashboard futtatás után törölni; dev-dashboard CSAK `WEB_PORT=3421`-gyel a klón `.env`-jében (a port-lock különben az élest lövi le).
+
+**Függő:** push a forkra (`cd ~/marveen && git push origin main`); Jev-routed élesítés a profil-térkép + `MODEL_ROUTING=all` + elegendő shadow-sor után; Codex/Gemini login, ha kell.
