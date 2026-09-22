@@ -190,3 +190,54 @@ Ellenőrzés a klónban: `tsc` tiszta; vitest 507 fájl — a 3 maradó piros k�
 - Klón-tesztek: a vitest live-install gate a `store/.dashboard-token` és `store/claudeclaw.db` létére bukik → dev-dashboard futtatás után törölni; dev-dashboard CSAK `WEB_PORT=3421`-gyel a klón `.env`-jében (a port-lock különben az élest lövi le).
 
 **Függő:** push a forkra (`cd ~/marveen && git push origin main`); Jev-routed élesítés a profil-térkép + `MODEL_ROUTING=all` + elegendő shadow-sor után; Codex/Gemini login, ha kell.
+
+## Hardening (2026-09-22/23, felügyelet nélküli futás) — branch `fix/agnostic-hardening`
+
+Alap: a `main` `04a3de8` (= az éles állapot). A review (runtime-mag, governance/csatorna, headless+Jev) talált hibáit javítja; **semmi nincs élesítve, pusholva vagy merge-elve**. A futás közben az éles `~/marveen`-hez, az éles `.env`-hez és a systemd unitokhoz nem nyúltam.
+
+### Commitok (időrendben)
+| Commit | Mit javít | Élesben hat? |
+|---|---|---|
+| `568386c` | egress-gate nyitott olvasó-posture: `localhost.`, `127.0.0.1.nip.io`, `7f000001.nip.io`, publikus név belső A-rekorddal (DNS-ellenőrzés, fail-closed), kiszivárgás-tiltólista (paste/webhook/rövidítő), nem szabvány port. Az upstream v1.39 merge ezeket elvesztette. | **Igen**: az élesben `quarantine_reader_posture: denylist` van; a hook-script hívásonként olvasódik, deploy után azonnal él |
+| `9538737` | a runtime-flagek a `.env`-ből is olvasódnak (a systemd unit nem tölti a `.env`-et → élesben eddig hatástalanok voltak); `MARVEEN_DEFAULT_RUNTIME` csak kompatibilis providerű agentet mozdít | Az éles `.env`-ben csak `MODEL_ROUTING=shadow` van → nincs viselkedésváltozás |
+| `6e6c1a2` | Jev mérési kapu kódban (`store/model-routing-calibration.json`), Jev-routed agent csak effektív `all` módban, alatta a saját modelljén fut és shadow-sort ír; hiszterézis-bug (a felfelé lépő célt is vétózta); hiányzó térkép-szint = feljebb lép | Nincs profil-térkép és `shadow` → nincs viselkedésváltozás |
+| `2be9737` | PolicyEngine: `"*"` matcher (eddig kivételt dobott → a teljes PostToolUse kiesett native-api-n), SessionStart source-matcher és a prompt ELŐTT fut, biztonsági kapuk fail-closed; native-api: útvonal realpath (`../..` és symlink kiszökés), hook `updatedInput` végrehajtva és újraellenőrizve, Claude-féle `Bash(curl *https://*)` szabályok + összetett parancsok részenként, Bash env-allowlist + process-group kill, redirect ugrásonként kapuzva, Stop-hook folytató kör, history méret szerint vágva | native-api élesben nem fut |
+| `c33ef25` | shimek: a Gemini `web_fetch` `{prompt}`-ot küld (nincs `url`) → az egress eddig átengedte; most URL-kinyerés és mindegyik kapuzva, URL nélkül tiltás; Codex argv-shell lapítás; összeomló kapu = tiltás | Codex/Gemini élesben nem fut |
+| `2010095` | bridge: a bridge reply-tool most a copy-gate és ledger-outbound matcherében; kimenő chat csak allowlistre; `send_file` csak munkakönyvtárból, titokfájl soha; bot-token nincs az MCP-definícióban; boríték `<channel`/`>` escapelés + `sender_id`; pairing-limit; egy poller (lock) + 409 = `conflict` | A bridge élesben ki van kapcsolva; a `.claude/settings.json` matcher-bővítése ártalmatlan (a fő-agent session-restartjakor él) |
+| `aaf1ec0` | renderelt configok 0600; `claude-headless` 3rd-party providernél nem örökli az Anthropic-tokent, hiányzó kulcs = auth-blokk; `export ANTHROPIC_AUTH_TOKEN` single-quote | A tmux-indítósor quotolása élő úton van (DeepSeek/MiniMax-API agentek) — ekvivalens normál kulcsokra |
+| `7bc82b9` | mcode-pluginok agentre szűkítve (`scope-hook.mjs`, a payload `cwd`-je alapján — **élőben mérve, hogy az mcode küldi**), név telepítésenként (`marveen-hooks-<SERVICE_ID>-<agent>`), a saját régi plugin törlése; Gemini cwd-lock + resume-őr; strict profil bekötve | **Igen, Scout**: a következő Scout-induláskor `marveen-hooks-icuka-scout` jön létre és a régi `marveen-hooks-scout` törlődik |
+| `b94575a` | paritás-mátrix: 6 kritikus kapu × 5 út (claude, native, codex-shim, gemini-shim, minimax-scope), valódi scriptekkel és valódi payload-alakokkal | — |
+| `674130c` | közös CLI-futtató (`cli-process.ts`): process-group kill, `exit`-fallback (pipe-ot tartó unoka nem akaszt), EPIPE, az eredmény nyer a timeout ellen, egységes usage; közös session-lánc (`stop` megszakítja a futó kört); `child-registry` + boot-kori árva-takarítás | **Igen, Scout**: a minimax-futások ezen mennek; élőben ellenőrizve |
+| `d8f3e72` | headless: tartós journal (a „sent” = perzisztált; crash/stop után visszajátszás figyelmeztető előtaggal; auth/kvóta = `deferred`), stop megszakít, readiness a sort is számolja, korlátos sor (20), log-rotáció + titokmaszkolás | **Igen, Scout** |
+| `9036c53` | Jev célelérhetőség: CLI-login tényleges ellenőrzése (minimax-előfizetés eddig elbukott, codex/gemini „mindig elérhető” volt), 429 → 15 perces kvóta-hűtés, nem blokkoló PATH-keresés | Nincs aktív routing → nincs viselkedésváltozás |
+| `268220b` | port-visszaszerzés csak a SAJÁT telepítés dashboardját ölheti (a dev-klón lelőtte az élest) | Védelem; normál működésben nincs hatása |
+| `55eba03` | élő tartóssági smoke (`scripts/smoke-headless-durability.ts`); reaper a vezér nélküli csoporttagokra is | — |
+| `0cacee5` | doksi (`docs/runtime.md`, `.env.example`), Codex/Gemini „kísérleti” jelölés a választóban | — |
+
+Jev-repó (`C:\Users\bkisc\Projects\Jev`, **külön branch** `feat/marveen-calibration-file`, `41be21c`, nincs merge-elve): `shadow_marveen_routing.py --write-calibration <út> [--approve background|all]`.
+
+### Ellenőrzés
+- `npm run typecheck` tiszta; `npm test`: 518 fájl, 6442 zöld, 2 piros — mindkettő a kiinduláskor is piros volt, a klón `.env`-jének `MAIN_AGENT_ID=icukadev` értéke miatt; `.env` nélkül mindkettő zöld (130/130).
+- **Élő (valódi MiniMax-előfizetés):** smoke — Read-tool, natív hook a scope-wrapperen át (payload-kulcsok: `cwd,hook_event_name,permission_mode,prompt_id,session_id,tool_input,tool_name,tool_use_id,transcript_path`, `cwd` = agent-könyvtár), resume, a próba-pluginok eltávolítva. Tartóssági smoke: kör közbeni „crash” → a journal `running`-ot tartott → újraindításkor visszajátszva az előtaggal → `DURABLE-OK`, a journal kiürült; az mcode a törött pipe-on maga kilépett és a tool-gyerekét is vitte (nem maradt árva folyamat).
+- **Élő (lokális Ollama):** native-api smoke — kapu, SessionStart, resume, usage rendben.
+- Élő Jev-mérés (read-only, az éles DB másolatán): 20 címkézett sor, 45% egyezés, 9/20 alul-routolás → a kapu jogos, az élesítéshez messze nincs elég bizonyíték.
+
+### Tudatos eltérések a tervtől
+- **F2.3 (AgentSessionDriver) nem készült el.** Közelebbről: az `agent-process.ts` headless-ágai primitívenként egy-egy korai visszatérés (a helyes határon); egy driver-objektum ágat nem spórolna, csak indirekciót adna egy 3400 soros, élesben kritikus fájlban. A watcher-őrök kockázatát a `capturePane` null-válasza már szerkezetileg kezeli.
+- **F2.2 részben**: az adapterek 4 session-másolata egyetlen `ResumeChainSessions`-szé vált; a külön `OneShotRuntime` interfészre bontás elmaradt (a `channel/service.ts` a meglévő spawn/send/state-et használja, most már közös implementáción).
+- **Dev-dashboardos élő próba elmaradt**: a klón reconcilere ugyanazon a tmux-szerveren az élő agentek session-jeibe nyúlhatna; felügyelet nélkül túl kockázatosnak ítéltem. Helyette célzott élő smoke-ok (fent).
+- Codex `auth.json` symlink: kód nem változott (a Codex élesben nem fut); a doksi az API-kulcs módot ajánlja flottára.
+
+### Éles deploy-checklist (owner-jóváhagyással)
+1. Mentés: `git -C ~/marveen tag pre-hardening 04a3de8` és DB-mentés (`cp ~/marveen/store/claudeclaw.db ~/marveen/store/backups/claudeclaw.pre-hardening.db`).
+2. Beolvasztás (fast-forward, az éles `main` = `04a3de8`): `git -C ~/marveen fetch /home/balint/marveen-agnostic fix/agnostic-hardening && git -C ~/marveen merge --ff-only FETCH_HEAD`.
+3. `cd ~/marveen && npm run build` (új függőség nincs), majd `systemctl --user restart icuka-dashboard`.
+4. Ellenőrzés: dashboard fut (3420); Scout újraindul a reconcilerrel → `ls ~/.minimax/plugins` = `marveen-hooks-icuka-scout` (a régi `marveen-hooks-scout` eltűnik); egy Icuka→Scout üzenet lefut; `store/headless-agents/scout.queue.json` üres a kör után.
+5. Egress-próba (reader-posture): `printf '{"tool_name":"WebFetch","tool_input":{"url":"http://127.0.0.1.nip.io/"},"agent_type":"quarantine-reader"}' | node ~/marveen/scripts/hooks/egress-gate.mjs` → `deny`.
+6. A fő-agent (`icuka-channels`) session-restartja NEM szükséges; a `.claude/settings.json` matcher-bővítés a következő természetes restartkor él.
+7. Visszaállás: `git -C ~/marveen reset --hard pre-hardening && cd ~/marveen && npm run build && systemctl --user restart icuka-dashboard` (Scout új pluginja ekkor maradhat; a régi név a régi kóddal újra létrejön).
+
+### Owner-teendők (változatlanul / újak)
+- Upstream PR a `Szotasz/marveen`-re az egress-javítással? (publikus művelet — döntés kell)
+- Jev: a kalibrációs fájl írása (`--write-calibration`) és jóváhagyás (`--approve`) csak ≥100 címkézett sor után; a Jev-repó branch merge-e.
+- Codex/Gemini login (utána a paritás-mátrix élő ellenőrzése és fixture-rögzítés), dev Telegram-bot a bridge élő próbájához — mint eddig.
