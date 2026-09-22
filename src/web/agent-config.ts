@@ -5,6 +5,8 @@ import { PROJECT_ROOT, MAIN_AGENT_ID, DEFAULT_AGENT_MODEL } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { safeJoin } from './sanitize.js'
 import { isValidModelId, InvalidModelIdError } from '../model-id.js'
+import { resolveRuntimeSpec, type RawRuntimeConfig, type ResolvedRuntimeSpec } from '../runtime/resolve-spec.js'
+import { isProviderKind, isRuntimeKind, type AgentRole } from '../runtime/types.js'
 import {
   resolveAgentModelFromConfig,
   validateModelProfileMap,
@@ -631,5 +633,50 @@ export function writeAgentCapabilities(name: string, capabilities: string[]): vo
   let config: Record<string, unknown> = {}
   try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
   config.capabilities = capabilities
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// ---- runtime / provider / authMode (agent-agnostic, Phase 0) ---------------
+//
+// Optional fields in agent-config.json. Absent fields resolve to exactly what
+// the fleet did before Phase 0 (runtime/resolve-spec.ts defaultRuntimeFor), so
+// no existing agent changes behaviour by the mere presence of this code.
+
+export function readAgentRuntimeConfig(name: string): RawRuntimeConfig {
+  const configPath = join(agentConfigRoot(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return { runtime: config.runtime, provider: config.provider, authMode: config.authMode }
+  } catch {
+    return {}
+  }
+}
+
+export function resolveAgentRuntimeSpec(name: string, role: AgentRole = name === MAIN_AGENT_ID ? 'main' : 'sub'): ResolvedRuntimeSpec {
+  return resolveRuntimeSpec(readAgentModel(name), readAgentRuntimeConfig(name), {
+    role,
+    envDefaultRuntime: process.env.MARVEEN_DEFAULT_RUNTIME,
+  })
+}
+
+// null removes the key (an absent field and an explicit null must not become
+// two ways of saying "default"); an unknown kind is rejected, never persisted.
+export function writeAgentRuntime(name: string, runtime: string | null): void {
+  if (runtime !== null && !isRuntimeKind(runtime)) throw new Error(`Ismeretlen runtime: ${String(runtime).slice(0, 40)}`)
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch { /* start fresh */ }
+  if (runtime === null) delete config.runtime
+  else config.runtime = runtime
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+export function writeAgentProvider(name: string, provider: string | null): void {
+  if (provider !== null && !isProviderKind(provider)) throw new Error(`Ismeretlen provider: ${String(provider).slice(0, 40)}`)
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch { /* start fresh */ }
+  if (provider === null) delete config.provider
+  else config.provider = provider
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }

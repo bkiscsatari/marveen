@@ -20,6 +20,8 @@
 // This module is dependency-free (no clock, tmux, or fs) so the state machine
 // is unit-testable. The I/O lives in src/web/context-guard-runner.ts.
 
+import { contextWindowFor } from './runtime/model-catalog.js'
+
 export interface ContextGuardConfig {
   /** Master toggle for the PROACTIVE tiers (actPct handoff / hardPct restart).
    *  Default FALSE: opt-in per agent. (The original rationale -- avoiding a
@@ -175,6 +177,10 @@ export function contextLimitForModel(model: string | null | undefined): number {
   if (typeof model !== 'string') return 200_000
   const m = model.toLowerCase()
   if (m.includes('[1m]')) return 1_000_000
+  // Provider-aware catalog first (runtime/model-catalog.ts: only VERIFIED
+  // windows are listed); the family heuristics below remain the fallback.
+  const fromCatalog = contextWindowFor(model)
+  if (fromCatalog !== null) return fromCatalog
   if (ONE_MILLION_FAMILIES.some(rx => rx.test(m))) return 1_000_000
   // minimax-m3 is a special case, NOT a general "trust the vendor" precedent
   // (see deepseek-v4-pro below, which stays 200_000 on live measurement).

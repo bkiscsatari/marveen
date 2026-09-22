@@ -2,7 +2,6 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatS
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { execFileSync } from 'node:child_process'
-import { OLLAMA_URL } from '../config.js'
 import { makeLazyBinResolver } from '../platform.js'
 import { logger } from '../logger.js'
 import {
@@ -820,80 +819,15 @@ export function agentSessionName(name: string): string {
   return `agent-${name}`
 }
 
-/**
- * POSIX single-quote a value for safe interpolation into a shell command STRING (card b7fa5281).
- *
- * The agent launch is a shell string tmux runs (`new-session -d -s <s> <cmd>`), and the model id --
- * which the operator controls via the dashboard -- was interpolated as `'${model}'`. Single-quoting
- * made a `:` safe but not a `'`: `x'; curl ... | sh; echo '` closed the quote and injected a command.
- * Wrapping in single quotes with each embedded `'` rewritten as `'\''` makes ANY value a single inert
- * shell word. This is defence #2 at the sink; the model-id allowlist (model-id.ts) is defence #1.
- */
-export function shSingleQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`
-}
-
-/**
- * hu: A modell-azonosító alapján eldönti, melyik providerhez tartozik, és felépíti a shell
- * export-láncot, ami a Claude Code CLI-t az adott provider Anthropic-kompatibilis végpontjára
- * téríti. Tiszta függvény (nincs I/O) -- a titkot a hívó adja át `secretLookup`-on keresztül,
- * hogy vault nélkül tesztelhető legyen.
- * <br />
- * en: Resolves which provider a model id belongs to and builds the shell export chain that
- * redirects the Claude Code CLI to that provider's Anthropic-compatible endpoint. Pure function
- * (no I/O) -- the caller supplies secrets via `secretLookup` so this is testable without a vault.
- */
-export type ProviderKind = 'claude' | 'deepseek' | 'minimax' | 'openrouter' | 'ollama'
-
-export function resolveProviderEnv(
-  model: string,
-  secretLookup: (id: string) => string | null,
-): { provider: ProviderKind; exportsStr: string } {
-  const isClaude = model.startsWith('claude-')
-  const isDeepseek = model.startsWith('deepseek-')
-  const isMinimax = model.startsWith('minimax-')
-  // OpenRouter model ids are `provider/model` (contain '/'); Ollama tags use
-  // ':' and no '/'. This discriminator keeps OpenRouter ids off the Ollama path.
-  const isOpenRouter = !isClaude && !isDeepseek && !isMinimax && model.includes('/')
-  const isOllama = !isClaude && !isDeepseek && !isMinimax && !isOpenRouter
-
-  if (isDeepseek) {
-    const key = secretLookup('DEEPSEEK_API_KEY') ?? ''
-    return {
-      provider: 'deepseek',
-      exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && export ANTHROPIC_MODEL=${shSingleQuote(model)} && `,
-    }
-  }
-  if (isMinimax) {
-    const key = secretLookup('MINIMAX_API_KEY') ?? ''
-    // MiniMax's own /anthropic compat layer misreports a 200K context window in
-    // its model metadata instead of M3's real 1M (MiniMax-AI/MiniMax-M2.7#46,
-    // confirmed live 2026-08-19: two independently running fleet agents on
-    // minimax-m3 converged on a measured ~200-203k ceiling). Claude Code trusts
-    // that metadata and auto-compacts at ~167k as a result. This env var is the
-    // vendor-documented workaround -- it tells the CLI the real number instead
-    // of the compat layer's wrong one.
-    return {
-      provider: 'minimax',
-      exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic && export ANTHROPIC_MODEL=${shSingleQuote(model)} && export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 && `,
-    }
-  }
-  if (isOpenRouter) {
-    // Anthropic-compatible endpoint at https://openrouter.ai/api (the SDK appends /v1/messages).
-    const key = secretLookup('openrouter-fleet-key') ?? ''
-    return {
-      provider: 'openrouter',
-      exportsStr: `export ANTHROPIC_AUTH_TOKEN="${key}" && export ANTHROPIC_BASE_URL=https://openrouter.ai/api && export ANTHROPIC_MODEL=${shSingleQuote(model)} && `,
-    }
-  }
-  if (isOllama) {
-    return {
-      provider: 'ollama',
-      exportsStr: `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && export ANTHROPIC_MODEL=${shSingleQuote(model)} && `,
-    }
-  }
-  return { provider: 'claude', exportsStr: '' }
-}
+// Phase 0 (agent-agnostic): shSingleQuote and the Anthropic-compatible
+// provider routing moved to src/runtime/ so every runtime adapter shares one
+// table. Re-exported under the historical names so call sites and tests are
+// unchanged. `ProviderKind` here is the LEGACY discriminator
+// ('claude'|'deepseek'|...); the new provider axis is runtime/types.ts.
+import { shSingleQuote } from '../runtime/shell-quote.js'
+import { resolveProviderEnv, type AnthropicCompatProvider } from '../runtime/anthropic-compat-env.js'
+export { shSingleQuote, resolveProviderEnv }
+export type ProviderKind = AnthropicCompatProvider
 
 // All tmux operations route through these two wrappers so the local-vs-remote
 // (ssh) decision and the quoting live in ONE place (ssh-tmux.ts). host=null is
