@@ -20,13 +20,11 @@
 //
 // Exit codes observed: 0 ok, 3 not signed in.
 
-import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { writePrivateFile } from './private-file.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { createInterface } from 'node:readline'
-import { randomBytes } from 'node:crypto'
 import { makeLazyBinResolver } from '../platform.js'
 import { logger } from '../logger.js'
 import { PROJECT_ROOT, SERVICE_ID } from '../config.js'
@@ -35,9 +33,9 @@ import { lookupProviderSecret } from './secret-ids.js'
 import { MinimaxStreamAccumulator, minimaxShowsAuthFailure, minimaxSummaryToRunResult } from './minimax-events.js'
 import { renderInstructionsMd, type ClaudeHooksConfig, type McpServerDef } from './bundle-render.js'
 import { streamDumper } from './stream-dump.js'
+import { runJsonlCli, finalizeRunResult, recordUsageBestEffort, ResumeChainSessions } from './cli-process.js'
 import type {
-  AgentHandle, AgentRuntime, AgentSpec, AgentState, HealthProbeResult, RunOptions, RunResult,
-  RuntimeCapabilities, SendOptions, SendOutcome, UsageCursor, UsageRecord,
+  AgentRuntime, AgentSpec, HealthProbeResult, RunOptions, RunResult, RuntimeCapabilities,
 } from './types.js'
 
 const mcodeBin = makeLazyBinResolver('mcode')
@@ -262,8 +260,6 @@ function ensurePluginInstalled(name: string): void {
   enabledPlugins.add(name)
 }
 
-interface Session { spec: AgentSpec; sessionId: string | null; chain: Promise<unknown>; inFlight: number; lastResult: RunResult | null; usage: UsageRecord[]; authFailed: boolean }
-const sessions = new Map<string, Session>()
 
 async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { continueLatest?: boolean } = {}): Promise<RunResult> {
   const bundle = prepareMinimaxBundle(spec)
@@ -276,85 +272,34 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { con
   const startedAt = Date.now()
   const acc = new MinimaxStreamAccumulator({ onText: opts.onProgress })
   const dump = streamDumper('minimax-cli', spec.id)
-  let stderrTail = ''
-  let timedOut = false
-  const exitCode = await new Promise<number | null>((resolve) => {
-    let child: ChildProcessWithoutNullStreams
-    try { child = spawn(mcodeBin(), args, { cwd, env }) } catch (err) { stderrTail = `spawn failed: ${(err as Error).message}`; resolve(null); return }
-    const timer = setTimeout(() => {
-      timedOut = true
-      logger.warn({ agent: spec.id, timeoutMs }, 'minimax-cli: run timed out, terminating')
-      try { child.kill('SIGTERM') } catch { /* gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL') } catch { /* gone */ } }, KILL_GRACE_MS).unref()
-    }, timeoutMs + KILL_GRACE_MS)
-    createInterface({ input: child.stdout }).on('line', (line) => { dump?.(line); acc.push(line) })
-    child.stderr.on('data', (d: Buffer) => { stderrTail = (stderrTail + d.toString()).slice(-2000) })
-    child.on('error', (err) => { stderrTail += ` spawn error: ${err.message}`; clearTimeout(timer); resolve(null) })
-    child.on('close', (code) => { clearTimeout(timer); resolve(code) })
-    child.stdin.on('error', () => { /* EPIPE on early exit */ })
-    child.stdin.end(prompt)
+  const out = await runJsonlCli({
+    // mcode's own --timeout ends the run first; ours is the backstop.
+    bin: mcodeBin(), args, cwd, env, stdin: prompt, timeoutMs: timeoutMs + KILL_GRACE_MS, signal: opts.signal, label: 'minimax-cli', agentId: spec.id,
+    onLine: (line) => { dump?.(line); acc.push(line) },
   })
   const summary = acc.summary()
-  let result = minimaxSummaryToRunResult(summary, { runtime: 'minimax-cli', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode, stderrTail })
-  if (timedOut) {
-    const mins = Math.round(timeoutMs / 60000)
-    result = opts.timeoutAsError
-      ? { ...result, text: null, blocked: true, reason: `timeout after ${mins}min` }
-      : { ...result, text: `A feldolgozas tullepte a ${mins} perces idokorlatot. Probald rovidebben megfogalmazni, vagy bontsd tobb lepesre.`, blocked: false }
-  }
-  if (result.blocked) logger.warn({ agent: spec.id, reason: result.reason, exitCode, auth: minimaxShowsAuthFailure(summary, stderrTail, exitCode) }, 'minimax-cli: run blocked/errored (text=null)')
-  if (result.usage && !result.blocked) {
-    try { const { recordRuntimeUsage } = await import('./usage-sink.js'); recordRuntimeUsage(spec.id, result.usage, { contentPreview: prompt.slice(0, 200) }) }
-    catch (err) { logger.debug({ err }, 'minimax-cli: usage sink unavailable (skipped)') }
-  }
+  const result = finalizeRunResult(minimaxSummaryToRunResult(summary, { runtime: 'minimax-cli', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode: out.exitCode, stderrTail: out.stderrTail }), out, { timeoutMs, timeoutAsError: opts.timeoutAsError })
+  if (result.blocked) logger.warn({ agent: spec.id, reason: result.reason, exitCode: out.exitCode, auth: minimaxShowsAuthFailure(summary, out.stderrTail, out.exitCode) }, 'minimax-cli: run blocked/errored (text=null)')
+  await recordUsageBestEffort(spec.id, result, prompt, 'minimax-cli')
   return result
 }
+
+// Long-lived handles = resume chains (shared implementation, cli-process.ts).
+const sessions = new ResumeChainSessions('minimax-cli', 'minimax', (spec, prompt, opts) => runOnce(spec, prompt, opts), (r) => /not signed in|login|auth|401|exit=3/i.test(r.reason ?? ''), (r) => /429|rate limit|quota|usage limit|insufficient/i.test(r.reason ?? ''))
 
 export const minimaxCliRuntime: AgentRuntime = {
   kind: 'minimax-cli',
   capabilities(agent: AgentSpec): RuntimeCapabilities {
     return { interactive: false, supportsResume: true, supportsHooks: 'native', supportsMcp: true, supportsChannelsPlugin: false, reportsUsage: 'events', contextWindow: contextLimitForModel(agent.model) }
   },
-  async spawn(agent: AgentSpec, opts: { fresh?: boolean } = {}): Promise<AgentHandle> {
-    const ref = `minimax:${agent.id}:${randomBytes(4).toString('hex')}`
-    let prior: string | null = null
-    if (!opts.fresh) for (const [k, s] of sessions) if (s.spec.id === agent.id && s.sessionId) { prior = s.sessionId; sessions.delete(k) }
-    prepareMinimaxBundle(agent)
-    sessions.set(ref, { spec: agent, sessionId: prior, chain: Promise.resolve(), inFlight: 0, lastResult: null, usage: [], authFailed: false })
-    return { agentId: agent.id, runtime: 'minimax-cli', sessionRef: ref, host: null }
-  },
-  async send(handle: AgentHandle, prompt: string, _opts: SendOptions = {}): Promise<SendOutcome> {
-    const s = sessions.get(handle.sessionRef)
-    if (!s) throw new Error(`minimax-cli: unknown handle ${handle.sessionRef}`)
-    s.inFlight++
-    const run = s.chain.then(async () => {
-      const r = await runOnce(s.spec, prompt, { resume: s.sessionId ?? undefined, allowTools: true, timeoutAsError: true })
-      s.lastResult = r
-      if (r.sessionRef) s.sessionId = r.sessionRef
-      if (r.usage && !r.blocked) s.usage.push(r.usage)
-      s.authFailed = r.blocked && /auth|Sign in|mcode login|exit=3/i.test(r.reason ?? '')
-    }).catch((err) => { logger.error({ err, agent: s.spec.id }, 'minimax-cli: send failed') }).finally(() => { s.inFlight-- })
-    s.chain = run
-    return 'sent'
-  },
+  spawn: async (agent, opts) => { prepareMinimaxBundle(agent); return sessions.spawn(agent, opts) },
+  send: (handle, prompt, opts) => sessions.send(handle, prompt, opts),
+
   async run(agent: AgentSpec, prompt: string, opts: RunOptions = {}): Promise<RunResult> { return runOnce(agent, prompt, opts) },
-  async state(handle: AgentHandle): Promise<AgentState> {
-    const s = sessions.get(handle.sessionRef)
-    if (!s) return 'dead'
-    if (s.inFlight > 0) return 'busy'
-    if (s.authFailed) return 'auth'
-    if (s.lastResult?.blocked && /429|rate limit|quota|insufficient/i.test(s.lastResult.reason ?? '')) return 'blocked'
-    return 'idle'
-  },
-  async stop(handle: AgentHandle): Promise<void> { sessions.delete(handle.sessionRef) },
-  async usageSince(handle: AgentHandle, cursor: UsageCursor | null): Promise<{ records: UsageRecord[]; cursor: UsageCursor }> {
-    const all = sessions.get(handle.sessionRef)?.usage ?? []
-    const from = typeof cursor?.value === 'number' ? cursor.value : 0
-    return { records: all.slice(from), cursor: { value: all.length } }
-  },
-  // `mcode provider list` only reports the configured credential SOURCE
-  // ("minimax_oauth active" even when logged out -- measured 2026-09-22), so
-  // the probe is a real one-step exec: exit 3 / "Sign in to MiniMax" = no login.
+  state: (handle) => sessions.state(handle),
+  stop: (handle) => sessions.stop(handle),
+  usageSince: (handle, cursor) => sessions.usageSince(handle, cursor),
+
   async healthProbe(agent: AgentSpec): Promise<HealthProbeResult> {
     let version = ''
     try { version = execFileSync(mcodeBin(), ['--version'], { encoding: 'utf-8', timeout: 15_000 }).trim() } catch (err) { return { ok: false, detail: `mcode not runnable: ${(err as Error).message}` } }

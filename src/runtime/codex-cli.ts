@@ -18,13 +18,11 @@
 // login on this host (no ChatGPT login / OpenAI key available) -- see
 // docs/agent-agnostic-progress.md for the owner to-do.
 
-import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, lstatSync } from 'node:fs'
 import { writePrivateFile } from './private-file.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { createInterface } from 'node:readline'
-import { randomBytes } from 'node:crypto'
 import { makeLazyBinResolver } from '../platform.js'
 import { logger } from '../logger.js'
 import { PROJECT_ROOT } from '../config.js'
@@ -32,18 +30,16 @@ import { contextLimitForModel } from '../context-guard.js'
 import { lookupProviderSecret } from './secret-ids.js'
 import { CodexStreamAccumulator, codexShowsAuthFailure, codexSummaryToRunResult } from './codex-events.js'
 import { streamDumper } from './stream-dump.js'
+import { runJsonlCli, finalizeRunResult, recordUsageBestEffort, ResumeChainSessions } from './cli-process.js'
 import {
-  renderCodexConfigToml, renderCodexHooksJson, renderInstructionsMd,
-  type ClaudeHooksConfig, type CodexSandboxMode, type McpServerDef,
+  renderCodexConfigToml, renderCodexHooksJson, renderInstructionsMd, type ClaudeHooksConfig, type CodexSandboxMode, type McpServerDef,
 } from './bundle-render.js'
 import type {
-  AgentHandle, AgentRuntime, AgentSpec, AgentState, HealthProbeResult, RunOptions, RunResult,
-  RuntimeCapabilities, SendOptions, SendOutcome, UsageCursor, UsageRecord,
+  AgentRuntime, AgentSpec, HealthProbeResult, RunOptions, RunResult, RuntimeCapabilities,
 } from './types.js'
 
 const codexBin = makeLazyBinResolver('codex')
 export const DEFAULT_CODEX_TIMEOUT_MS = Number(process.env.MARVEEN_AGENT_TIMEOUT_MS) || 20 * 60 * 1000
-const KILL_GRACE_MS = 5_000
 
 // --- pure builders (unit-tested) ---------------------------------------------
 
@@ -200,16 +196,6 @@ export function prepareCodexBundle(spec: AgentSpec, opts: { permissionMode?: 'pe
 
 // --- sessions (thread ids) ------------------------------------------------------
 
-interface CodexSession {
-  spec: AgentSpec
-  threadId: string | null
-  chain: Promise<unknown>
-  inFlight: number
-  lastResult: RunResult | null
-  usage: UsageRecord[]
-  authFailed: boolean
-}
-const sessions = new Map<string, CodexSession>()
 
 // --- run ---------------------------------------------------------------------------
 
@@ -230,47 +216,19 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
   const startedAt = Date.now()
   const acc = new CodexStreamAccumulator({ onText: opts.onProgress })
   const dump = streamDumper('codex-cli', spec.id)
-  let stderrTail = ''
-  let timedOut = false
-
-  const exitCode = await new Promise<number | null>((resolve) => {
-    let child: ChildProcessWithoutNullStreams
-    try { child = spawn(codexBin(), args, { cwd, env }) } catch (err) {
-      stderrTail = `spawn failed: ${(err as Error).message}`; resolve(null); return
-    }
-    const timer = setTimeout(() => {
-      timedOut = true
-      logger.warn({ agent: spec.id, timeoutMs }, 'codex-cli: run timed out, terminating')
-      try { child.kill('SIGTERM') } catch { /* gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL') } catch { /* gone */ } }, KILL_GRACE_MS).unref()
-    }, timeoutMs)
-    createInterface({ input: child.stdout }).on('line', (line) => { dump?.(line); acc.push(line) })
-    child.stderr.on('data', (d: Buffer) => { stderrTail = (stderrTail + d.toString()).slice(-2000) })
-    child.on('error', (err) => { stderrTail += ` spawn error: ${err.message}`; clearTimeout(timer); resolve(null) })
-    child.on('close', (code) => { clearTimeout(timer); resolve(code) })
-    child.stdin.on('error', () => { /* EPIPE on early exit; close handler reports */ })
-    child.stdin.end(prompt)
+  const out = await runJsonlCli({
+    bin: codexBin(), args, cwd, env, stdin: prompt, timeoutMs, signal: opts.signal, label: 'codex-cli', agentId: spec.id,
+    onLine: (line) => { dump?.(line); acc.push(line) },
   })
-
   const summary = acc.summary()
-  let result = codexSummaryToRunResult(summary, { runtime: 'codex-cli', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode, stderrTail })
-  if (timedOut) {
-    const mins = Math.round(timeoutMs / 60000)
-    result = opts.timeoutAsError
-      ? { ...result, text: null, blocked: true, reason: `timeout after ${mins}min` }
-      : { ...result, text: `A feldolgozas tullepte a ${mins} perces idokorlatot. Probald rovidebben megfogalmazni, vagy bontsd tobb lepesre.`, blocked: false }
-  }
-  if (result.blocked) {
-    logger.warn({ agent: spec.id, reason: result.reason, exitCode, auth: codexShowsAuthFailure(summary) }, 'codex-cli: run blocked/errored (text=null)')
-  }
-  if (result.usage && !result.blocked) {
-    try {
-      const { recordRuntimeUsage } = await import('./usage-sink.js')
-      recordRuntimeUsage(spec.id, result.usage, { contentPreview: prompt.slice(0, 200) })
-    } catch (err) { logger.debug({ err }, 'codex-cli: usage sink unavailable (skipped)') }
-  }
+  const result = finalizeRunResult(codexSummaryToRunResult(summary, { runtime: 'codex-cli', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode: out.exitCode, stderrTail: out.stderrTail }), out, { timeoutMs, timeoutAsError: opts.timeoutAsError })
+  if (result.blocked) logger.warn({ agent: spec.id, reason: result.reason, exitCode: out.exitCode, auth: codexShowsAuthFailure(summary) }, 'codex-cli: run blocked/errored (text=null)')
+  await recordUsageBestEffort(spec.id, result, prompt, 'codex-cli')
   return result
 }
+
+// Long-lived handles = resume chains (shared implementation, cli-process.ts).
+const sessions = new ResumeChainSessions('codex-cli', 'codex', (spec, prompt, opts) => runOnce(spec, prompt, opts), (r) => /401|Unauthorized|Missing bearer|not logged in/i.test(r.reason ?? ''), (r) => /429|rate limit|usage limit|quota/i.test(r.reason ?? ''))
 
 export const codexCliRuntime: AgentRuntime = {
   kind: 'codex-cli',
@@ -287,54 +245,17 @@ export const codexCliRuntime: AgentRuntime = {
     }
   },
 
-  async spawn(agent: AgentSpec, opts: { fresh?: boolean } = {}): Promise<AgentHandle> {
-    const ref = `codex:${agent.id}:${randomBytes(4).toString('hex')}`
-    let prior: string | null = null
-    if (!opts.fresh) for (const [k, s] of sessions) if (s.spec.id === agent.id && s.threadId) { prior = s.threadId; sessions.delete(k) }
-    prepareCodexBundle(agent)
-    sessions.set(ref, { spec: agent, threadId: prior, chain: Promise.resolve(), inFlight: 0, lastResult: null, usage: [], authFailed: false })
-    return { agentId: agent.id, runtime: 'codex-cli', sessionRef: ref, host: null }
-  },
-
-  async send(handle: AgentHandle, prompt: string, _opts: SendOptions = {}): Promise<SendOutcome> {
-    const s = sessions.get(handle.sessionRef)
-    if (!s) throw new Error(`codex-cli: unknown handle ${handle.sessionRef}`)
-    s.inFlight++
-    const run = s.chain.then(async () => {
-      const r = await runOnce(s.spec, prompt, { resume: s.threadId ?? undefined, allowTools: true, timeoutAsError: true })
-      s.lastResult = r
-      if (r.sessionRef) s.threadId = r.sessionRef
-      if (r.usage && !r.blocked) s.usage.push(r.usage)
-      s.authFailed = r.blocked && /401|Unauthorized|Missing bearer|not logged in/i.test(r.reason ?? '')
-    }).catch((err) => { logger.error({ err, agent: s.spec.id }, 'codex-cli: send failed') })
-      .finally(() => { s.inFlight-- })
-    s.chain = run
-    return 'sent'
-  },
+  spawn: async (agent, opts) => { prepareCodexBundle(agent); return sessions.spawn(agent, opts) },
+  send: (handle, prompt, opts) => sessions.send(handle, prompt, opts),
 
   async run(agent: AgentSpec, prompt: string, opts: RunOptions = {}): Promise<RunResult> {
     return runOnce(agent, prompt, opts)
   },
 
-  async state(handle: AgentHandle): Promise<AgentState> {
-    const s = sessions.get(handle.sessionRef)
-    if (!s) return 'dead'
-    if (s.inFlight > 0) return 'busy'
-    if (s.authFailed) return 'auth'
-    if (s.lastResult?.blocked && /429|rate limit|usage limit|quota/i.test(s.lastResult.reason ?? '')) return 'blocked'
-    return 'idle'
-  },
+  state: (handle) => sessions.state(handle),
+  stop: (handle) => sessions.stop(handle),
+  usageSince: (handle, cursor) => sessions.usageSince(handle, cursor),
 
-  async stop(handle: AgentHandle): Promise<void> { sessions.delete(handle.sessionRef) },
-
-  async usageSince(handle: AgentHandle, cursor: UsageCursor | null): Promise<{ records: UsageRecord[]; cursor: UsageCursor }> {
-    const all = sessions.get(handle.sessionRef)?.usage ?? []
-    const from = typeof cursor?.value === 'number' ? cursor.value : 0
-    return { records: all.slice(from), cursor: { value: all.length } }
-  },
-
-  // Cheap probe: no tokens spent. `codex login status` prints "Not logged in"
-  // (exit 1) or the logged-in account. API mode: key presence in the vault.
   async healthProbe(agent: AgentSpec): Promise<HealthProbeResult> {
     let version = ''
     try { version = execFileSync(codexBin(), ['--version'], { encoding: 'utf-8', timeout: 15_000 }).trim() } catch (err) {

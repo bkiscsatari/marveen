@@ -37,17 +37,13 @@
 // headless: a target that names claude-tmux is run as claude-headless (same
 // Claude subscription, no TUI), so the loop never has to respawn a pane.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { MAIN_AGENT_ID, STORE_DIR } from '../config.js'
 import { logger } from '../logger.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import {
-  readAgentModelRouting,
-  readAgentRemoteHost,
-  resolveAgentRuntimeSpec,
-  readModelProfileMap,
-  resolveModelId,
+  readAgentModelRouting, readAgentRemoteHost, resolveAgentRuntimeSpec, readModelProfileMap, resolveModelId,
 } from './agent-config.js'
 import { buildAgentSpec } from '../runtime/agent-spec.js'
 import { getRuntime, RuntimeNotAvailableError } from '../runtime/registry.js'

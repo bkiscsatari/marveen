@@ -16,13 +16,10 @@
 // --resume continuity, two-turn --input-format stream-json, and the
 // rate_limit_event that carries the 5h/7d subscription utilisation.
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { writePrivateFile } from './private-file.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { createInterface } from 'node:readline'
-import { randomBytes } from 'node:crypto'
 import { makeLazyBinResolver } from '../platform.js'
 import { logger } from '../logger.js'
 import { readEnvFile } from '../env.js'
@@ -32,9 +29,9 @@ import { resolveProviderEnvVars } from './anthropic-compat-env.js'
 import { lookupProviderSecret } from './secret-ids.js'
 import { ClaudeStreamAccumulator, streamShowsAuthFailure, summaryToRunResult, type RateLimitInfo } from './stream-json.js'
 import { streamDumper } from './stream-dump.js'
+import { runJsonlCli, finalizeRunResult, recordUsageBestEffort, ResumeChainSessions } from './cli-process.js'
 import type {
-  AgentHandle, AgentRuntime, AgentSpec, AgentState, HealthProbeResult, RunOptions, RunResult,
-  RuntimeCapabilities, SendOptions, SendOutcome, UsageCursor, UsageRecord,
+  AgentRuntime, AgentSpec, HealthProbeResult, RunOptions, RunResult, RuntimeCapabilities,
 } from './types.js'
 
 const claudeBin = makeLazyBinResolver('claude')
@@ -45,7 +42,6 @@ const claudeBin = makeLazyBinResolver('claude')
 export const HEADLESS_DISALLOWED_TOOLS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'Task'] as const
 
 export const DEFAULT_HEADLESS_TIMEOUT_MS = Number(process.env.MARVEEN_AGENT_TIMEOUT_MS) || 20 * 60 * 1000
-const KILL_GRACE_MS = 5_000
 
 // --- pure builders (unit-tested) ---------------------------------------------
 
@@ -197,23 +193,6 @@ export function headlessWorkerSpec(): AgentSpec {
   }
 }
 
-// --- long-lived handles (headless "sessions" = resume chains) ----------------
-
-interface HeadlessSession {
-  spec: AgentSpec
-  sessionId: string | null
-  chain: Promise<unknown>
-  inFlight: number
-  lastResult: RunResult | null
-  lastRateLimit: RateLimitInfo | null
-  usage: UsageRecord[]
-  authFailed: boolean
-}
-
-const sessions = new Map<string, HeadlessSession>()
-
-function handleKey(h: AgentHandle): string { return h.sessionRef }
-
 // --- the adapter --------------------------------------------------------------
 
 async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onRateLimit?: (r: RateLimitInfo) => void } = {}): Promise<RunResult> {
@@ -254,71 +233,33 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onR
   const startedAt = Date.now()
   const acc = new ClaudeStreamAccumulator({ onText: opts.onProgress })
   const dump = streamDumper('claude-headless', spec.id)
-  let stderrTail = ''
-  let timedOut = false
-
-  const exitCode = await new Promise<number | null>((resolve) => {
-    let child: ChildProcessWithoutNullStreams
-    try {
-      // Default stdio = three pipes (typed as never-null streams).
-      child = spawn(claudeBin(), args, { cwd, env })
-    } catch (err) {
-      stderrTail = `spawn failed: ${(err as Error).message}`
-      resolve(null)
-      return
-    }
-    const timer = setTimeout(() => {
-      timedOut = true
-      logger.warn({ agent: spec.id, timeoutMs }, 'claude-headless: run timed out, terminating')
-      try { child.kill('SIGTERM') } catch { /* gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL') } catch { /* gone */ } }, KILL_GRACE_MS).unref()
-    }, timeoutMs)
-    const rl = createInterface({ input: child.stdout })
-    rl.on('line', (line) => {
+  const out = await runJsonlCli({
+    bin: claudeBin(), args, cwd, env, stdin: prompt, timeoutMs, signal: opts.signal, label: 'claude-headless', agentId: spec.id,
+    onLine: (line) => {
       dump?.(line)
       const ev = acc.push(line)
       if (ev && ev.type === 'rate_limit_event' && opts.onRateLimit) {
         const info = (ev as { rate_limit_info?: RateLimitInfo }).rate_limit_info
         if (info) opts.onRateLimit(info)
       }
-    })
-    child.stderr.on('data', (d: Buffer) => { stderrTail = (stderrTail + d.toString()).slice(-2000) })
-    child.on('error', (err) => { stderrTail += ` spawn error: ${err.message}`; clearTimeout(timer); resolve(null) })
-    child.on('close', (code) => { clearTimeout(timer); resolve(code) })
-    child.stdin.on('error', () => { /* EPIPE when the CLI exits early; the close handler reports it */ })
-    child.stdin.end(prompt)
+    },
   })
-
-  const summary = acc.summary()
-  const result = summaryToRunResult(summary, {
-    runtime: 'claude-headless', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode, stderrTail,
-  })
-  if (timedOut) {
-    const mins = Math.round(timeoutMs / 60000)
-    if (opts.timeoutAsError) {
-      return { ...result, text: null, blocked: true, reason: `timeout after ${mins}min` }
-    }
-    // Historical runAgent contract: a human-facing apology as the text.
-    return { ...result, text: `A feldolgozas tullepte a ${mins} perces idokorlatot. Probald rovidebben megfogalmazni, vagy bontsd tobb lepesre.`, blocked: false }
-  }
+  const result = finalizeRunResult(summaryToRunResult(acc.summary(), {
+    runtime: 'claude-headless', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode: out.exitCode, stderrTail: out.stderrTail,
+  }), out, { timeoutMs, timeoutAsError: opts.timeoutAsError })
   if (result.blocked) {
-    logger.warn({ agent: spec.id, reason: result.reason, exitCode }, 'claude-headless: run blocked/errored (text=null)')
+    logger.warn({ agent: spec.id, reason: result.reason, exitCode: out.exitCode }, 'claude-headless: run blocked/errored (text=null)')
   }
-  // Usage sink is best-effort and never fails the run.
-  if (result.usage) {
-    try {
-      const { recordRuntimeUsage } = await import('./usage-sink.js')
-      recordRuntimeUsage(spec.id, result.usage, { contentPreview: prompt.slice(0, 200) })
-    } catch (err) {
-      logger.debug({ err }, 'claude-headless: usage sink unavailable (skipped)')
-    }
-  }
+  await recordUsageBestEffort(spec.id, result, prompt, 'claude-headless')
   return result
 }
 
 function summaryAuth(result: RunResult): boolean {
   return !!result.reason && /authentication_failed|Not logged in|Please run \/login|api_error_status=401/i.test(result.reason)
 }
+
+// Headless "sessions" = resume chains (shared implementation, cli-process.ts).
+const sessions = new ResumeChainSessions('claude-headless', 'headless', (spec, prompt, opts) => runOnce(spec, prompt, opts), summaryAuth, (r) => /rate_limit|429|usage limit/i.test(r.reason ?? ''))
 
 export const claudeHeadlessRuntime: AgentRuntime = {
   kind: 'claude-headless',
@@ -335,63 +276,16 @@ export const claudeHeadlessRuntime: AgentRuntime = {
     }
   },
 
-  async spawn(agent: AgentSpec, opts: { fresh?: boolean } = {}): Promise<AgentHandle> {
-    const ref = `headless:${agent.id}:${randomBytes(4).toString('hex')}`
-    // A "fresh" spawn drops any earlier chain for this agent; otherwise reuse
-    // the newest session id so the conversation continues across restarts.
-    let prior: string | null = null
-    if (!opts.fresh) {
-      for (const [k, s] of sessions) if (s.spec.id === agent.id && s.sessionId) { prior = s.sessionId; sessions.delete(k) }
-    }
-    sessions.set(ref, { spec: agent, sessionId: prior, chain: Promise.resolve(), inFlight: 0, lastResult: null, lastRateLimit: null, usage: [], authFailed: false })
-    return { agentId: agent.id, runtime: 'claude-headless', sessionRef: ref, host: null }
-  },
-
-  async send(handle: AgentHandle, prompt: string, _opts: SendOptions = {}): Promise<SendOutcome> {
-    const s = sessions.get(handleKey(handle))
-    if (!s) throw new Error(`claude-headless: unknown handle ${handle.sessionRef}`)
-    s.inFlight++
-    const run = s.chain.then(async () => {
-      const r = await runOnce(s.spec, prompt, {
-        resume: s.sessionId ?? undefined, allowTools: true, timeoutAsError: true,
-        onRateLimit: (info) => { s.lastRateLimit = info },
-      })
-      s.lastResult = r
-      if (r.sessionRef) s.sessionId = r.sessionRef
-      if (r.usage) s.usage.push(r.usage)
-      s.authFailed = r.blocked && summaryAuth(r)
-    }).catch((err) => {
-      logger.error({ err, agent: s.spec.id }, 'claude-headless: send failed')
-    }).finally(() => { s.inFlight-- })
-    s.chain = run
-    return 'sent'
-  },
+  spawn: (agent, opts) => sessions.spawn(agent, opts),
+  send: (handle, prompt, opts) => sessions.send(handle, prompt, opts),
 
   async run(agent: AgentSpec, prompt: string, opts: RunOptions = {}): Promise<RunResult> {
     return runOnce(agent, prompt, opts)
   },
 
-  async state(handle: AgentHandle): Promise<AgentState> {
-    const s = sessions.get(handleKey(handle))
-    if (!s) return 'dead'
-    if (s.inFlight > 0) return 'busy'
-    if (s.authFailed) return 'auth'
-    if (s.lastResult?.blocked && /rate_limit|429|usage limit/i.test(s.lastResult.reason ?? '')) return 'blocked'
-    return 'idle'
-  },
-
-  async stop(handle: AgentHandle): Promise<void> {
-    // In-flight child processes finish on their own (bounded by timeout);
-    // the chain simply stops accepting new prompts.
-    sessions.delete(handleKey(handle))
-  },
-
-  async usageSince(handle: AgentHandle, cursor: UsageCursor | null): Promise<{ records: UsageRecord[]; cursor: UsageCursor }> {
-    const s = sessions.get(handleKey(handle))
-    const from = typeof cursor?.value === 'number' ? cursor.value : 0
-    const all = s?.usage ?? []
-    return { records: all.slice(from), cursor: { value: all.length } }
-  },
+  state: (handle) => sessions.state(handle),
+  stop: (handle) => sessions.stop(handle),
+  usageSince: (handle, cursor) => sessions.usageSince(handle, cursor),
 
   async healthProbe(agent: AgentSpec): Promise<HealthProbeResult> {
     const r = await runOnce(

@@ -174,6 +174,8 @@ export interface RunOptions {
   env?: Record<string, string | undefined>
   /** Streaming text chunks as the model produces them (live output views). */
   onProgress?: (chunk: string) => void
+  /** Abort the run (operator stop): the CLI's whole process group is terminated. */
+  signal?: AbortSignal
 }
 
 export interface HealthProbeResult {

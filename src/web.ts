@@ -1,5 +1,6 @@
 import http from 'node:http'
 import { workerRuntimeKind, agentBackend } from './runtime/flags.js'
+import { initChildRegistry, reapOrphanedChildren } from './runtime/child-registry.js'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -377,6 +378,22 @@ export function startWebServer(port = 3420): http.Server {
   const webOnly = process.env['WEB_ONLY'] === 'true'
   if (webOnly) {
     logger.info('[staging] WEB_ONLY mode: background services disabled')
+  }
+
+  // Runtime CLI children (claude -p / codex / gemini / mcode) are tracked in
+  // store/runtime-children.json. KillMode=process leaves them running across a
+  // dashboard restart with nobody enforcing their timeout, so the groups a
+  // previous process left behind are reaped BEFORE the router can re-deliver
+  // their work (double execution). Staging (WEB_ONLY) never reaps.
+  if (!webOnly) {
+    try {
+      const storeDir = join(PROJECT_ROOT, 'store')
+      const reaped = reapOrphanedChildren(storeDir)
+      initChildRegistry(storeDir)
+      if (reaped) logger.warn({ reaped }, 'runtime: orphaned CLI process groups from the previous dashboard run were terminated')
+    } catch (err) {
+      logger.warn({ err }, 'runtime: child registry init failed (orphan reaping skipped)')
+    }
   }
 
   const routerInterval = webOnly ? undefined : startMessageRouter()
