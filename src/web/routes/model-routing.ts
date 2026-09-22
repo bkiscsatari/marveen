@@ -10,7 +10,7 @@
 
 import { listModelRoutingLog, modelRoutingSummary } from '../../db.js'
 import { jevConfigured } from '../jev-client.js'
-import { routingMode } from '../model-routing.js'
+import { routingMode, routingModeStatus } from '../model-routing.js'
 import { json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
@@ -19,7 +19,7 @@ export async function tryHandleModelRouting(ctx: RouteContext): Promise<boolean>
   if (method !== 'GET') return false
 
   if (path === '/api/model-routing') {
-    json(res, { mode: routingMode(), configured: jevConfigured(), summary: modelRoutingSummary() })
+    json(res, { mode: routingMode(), modeStatus: routingModeStatus(), configured: jevConfigured(), summary: modelRoutingSummary() })
     return true
   }
 

@@ -37,7 +37,7 @@ import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
 import { composeBatchInjection, batchInjectCapFor } from './batch-inject.js'
 import { maybeWakeSubAgentsForTelegram } from './telegram-inbox-wake.js'
-import { shadowRoute } from './model-routing.js'
+import { shadowRoute, routingMode } from './model-routing.js'
 
 // A message that cannot be delivered within this window (target session never
 // exists / stays busy) is marked failed so it stops clogging the pending
@@ -822,8 +822,10 @@ export async function runMessageRouterTick(): Promise<void> {
         // calibration log. Detached, never awaited, never blocks delivery.
         // Channel inbounds (a human's Telegram text) are not delegated tasks.
         // A Jev-routed headless agent classifies (and applies) at delivery in
-        // its own session loop; logging it here too would double-count.
-        if (!isChannelInbound && !isRoutedHeadlessAgent(msg.to_agent)) shadowRoute({ source: 'inter_agent', agent: msg.to_agent, text: content, taskRef: String(msg.id) })
+        // its own session loop; logging it here too would double-count -- but only
+        // while routing is APPLIED (mode `all`). Below that the loop does not
+        // classify, so the row is written here like for any other agent.
+        if (!isChannelInbound && !(isRoutedHeadlessAgent(msg.to_agent) && routingMode() === 'all')) shadowRoute({ source: 'inter_agent', agent: msg.to_agent, text: content, taskRef: String(msg.id) })
         // Freshness/supersession signal: only meaningful for inter-agent
         // messages (channel-inbound are user messages with no sender-supersede
         // concept). Skip the DB count for channel-inbound to avoid needless work.

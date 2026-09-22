@@ -222,13 +222,21 @@ export function decideProfile(
 }
 
 /**
- * B1 policy (NOT wired in B0): whether a suggestion should move an agent
- * from `current` to `suggested`. Upward moves (stronger tier) apply on any
- * actionable decision; downward moves need two full tiers of difference so
- * a borderline call cannot flap an agent between neighbouring models.
+ * B1 policy: whether a suggestion should move an agent from `current` to
+ * `suggested`. Upward moves (stronger tier) apply on any actionable decision;
+ * downward moves need two full tiers of difference so a borderline call cannot
+ * flap an agent between neighbouring models.
+ *
+ * `suggested` is the tier that will actually run -- pickTarget() may have
+ * climbed ABOVE Jev's profile because that one was unavailable. Such a target
+ * is accepted (it is never weaker than what Jev asked for); a target weaker
+ * than Jev's profile never is. The first version demanded
+ * `decision.profile === suggested`, which silently vetoed every climb, even
+ * an upgrade, and logged it as hysteresis.
  */
 export function shouldSwitch(current: ModelProfileId, suggested: ModelProfileId, decision: RoutingDecision): boolean {
-  if (!decision.actionable || decision.profile !== suggested) return false
+  if (!decision.actionable || !decision.profile) return false
+  if (profileRank(suggested) > profileRank(decision.profile)) return false // weaker than Jev's call: never
   const diff = profileRank(current) - profileRank(suggested) // >0 = suggested is stronger
   if (diff > 0) return true
   return diff <= -2
@@ -255,13 +263,17 @@ export function pickTarget(
 ): TargetPick {
   if (decision.needsReview || !decision.profile) return { kind: 'skip', reason: 'needs_review' }
   if (!decision.actionable) return { kind: 'skip', reason: 'not_actionable' }
-  const wanted = targets[decision.profile]
-  if (!wanted) return { kind: 'skip', reason: `profile_map_missing:${decision.profile}` }
-  // Walk from the suggested tier upward (stronger) until one is available.
+  // Walk from the suggested tier upward (stronger) until one is mapped AND
+  // available. A tier missing from the map is treated like an unavailable one
+  // (climb), consistently; only a map with no usable tier at or above the
+  // suggestion skips.
+  let anyMapped = false
   for (let rank = profileRank(decision.profile); rank >= 0; rank--) {
     const p = MODEL_PROFILE_IDS[rank]
     const t = targets[p]
+    if (t) anyMapped = true
     if (t && isAvailable(t)) return { kind: 'apply', profile: p, target: t }
   }
+  if (!anyMapped) return { kind: 'skip', reason: `profile_map_missing:${decision.profile}` }
   return { kind: 'skip', reason: `target_unavailable:${decision.profile}` }
 }

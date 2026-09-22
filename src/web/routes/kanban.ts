@@ -26,7 +26,7 @@ import { listAgentNames, readAgentDisplayName } from '../agent-config.js'
 import { isAgentRunning } from '../agent-process.js'
 import { isRoutedHeadlessAgent } from '../headless-agents.js'
 import { resolveKanbanDispatch } from '../../kanban-dispatch.js'
-import { shadowRoute } from '../model-routing.js'
+import { shadowRoute, routingMode } from '../model-routing.js'
 import { generateBreakdown } from '../llm-breakdown.js'
 import { logger } from '../../logger.js'
 import { readBody, json, jsonMaybeGzip, methodNotAllowed } from '../http-helpers.js'
@@ -193,7 +193,7 @@ function fireKanbanDispatch(id: string, actor?: string | null): void {
     // dispatch text, is what a router would classify. A Jev-routed headless
     // agent is classified by its own session loop at delivery (where the
     // decision is applied), so it is not logged twice here.
-    if (!isRoutedHeadlessAgent(target)) shadowRoute({ source: 'kanban', agent: target, text: `${card.title}\n${desc}`, taskRef: id })
+    if (!(isRoutedHeadlessAgent(target) && routingMode() === 'all')) shadowRoute({ source: 'kanban', agent: target, text: `${card.title}\n${desc}`, taskRef: id })
     logger.info({ id, target, assignee: card.assignee }, 'Kanban in_progress dispatch fired')
   } catch (err) {
     logger.warn({ err, id }, 'Kanban dispatch failed (card move still succeeded)')

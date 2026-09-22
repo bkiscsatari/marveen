@@ -255,11 +255,27 @@ describe('headless session agent: Jev-routed', () => {
     expect(headlessInfo('scout')?.runtime).toBe('claude-headless')
   })
 
-  it('a routed agent without a profile map cannot start', async () => {
-    _setHeadlessDepsForTest({ buildSpec: () => spec(), readRouting: () => 'jev', storeDir: () => storeDir })
+  it('a routed agent without a profile map cannot start while routing is applied', async () => {
+    _setHeadlessDepsForTest({ buildSpec: () => spec(), readRouting: () => 'jev', routingAll: () => true, storeDir: () => storeDir })
     const r = await startHeadlessAgent('scout')
     expect(r.ok).toBe(false)
     expect(r.error).toMatch(/profile map/)
     expect(existsSync(join(storeDir, 'headless-agents.json'))).toBe(false)
+  })
+
+  it('a routed agent below mode `all` runs its OWN model, never the routine_lowcost target', async () => {
+    // Regression: choosing "Jev-routed" in shadow mode used to move the agent
+    // onto the cheapest tier and leave it there (shadow never reroutes).
+    let initialAsked = 0
+    _setHeadlessDepsForTest({
+      buildSpec: () => spec(), readRouting: () => 'jev', routingAll: () => false,
+      initialRoutedTarget: () => { initialAsked++; return { ok: true, runtime: 'native-api', provider: 'ollama', model: 'qwen2.5:1.5b' } },
+      storeDir: () => storeDir,
+    })
+    const r = await startHeadlessAgent('scout')
+    expect(r.ok).toBe(true)
+    expect(initialAsked).toBe(0)
+    expect(headlessInfo('scout')?.model).toBe(spec().model)
+    expect(headlessInfo('scout')?.profile).toBeNull()
   })
 })

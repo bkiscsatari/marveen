@@ -71,5 +71,23 @@ B1 (élesítés) külön jóváhagyás után, ebben a sorrendben:
 3. a fő-agent Telegram-chatje fix marad (a channels plugin közvetlenül a sessionbe ad, üzenetenként
    nem routolható) — a nehéz munkát delegálja, a delegált út routolt.
 
-Kill-switch: `MODEL_ROUTING=off`. A `background` és `all` mód-értékek foglaltak a B1-nek, ma
-`shadow`-ként viselkednek.
+Kill-switch: `MODEL_ROUTING=off`.
+
+## Mérési kapu a kódban (B1 élesítés)
+
+A `background` (háttérfeladatok) és `all` (+ Jev-routed headless agentek) mód **csak akkor alkalmaz**
+javaslatot, ha a `store/model-routing-calibration.json` átmegy a kapun (`src/web/routing-gate.ts`):
+
+```json
+{ "labelledRows": 140, "fitRows": 70, "holdoutRows": 70, "holdoutAgreement": 0.72,
+  "generatedAt": "2026-10-01T10:00:00Z", "approvedAt": "2026-10-02", "approvedModes": ["background"] }
+```
+
+- `labelledRows ≥ 100`, van held-out mérés (`holdoutRows > 0`, `holdoutAgreement` szám);
+- `approvedAt` + `approvedModes`: az owner jóváhagyása, módonként (`all` jóváhagyás a `background`-ot is fedi, fordítva nem).
+
+A mért mezőket a Jev-repó riportja írja: `python scripts/shadow_marveen_routing.py --write-calibration <út>`;
+a jóváhagyást kézzel (vagy `--approve background`) kell hozzáadni. Kapu nélkül az apply-mód **shadow-ként
+fut** (a sorok íródnak, semmi nem vált), a dashboard `/api/model-routing` `modeStatus` mezője és a log
+megmondja, miért. Jev-routed agent csak effektív `all` módban menthető; ha a kapu később bezár, a routed
+agent a saját modelljén fut tovább (nem a `routine_lowcost` célon), és shadow-sort ír.

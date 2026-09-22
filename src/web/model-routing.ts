@@ -39,25 +39,47 @@ import { inferProvider, runtimeSupportsProvider, defaultRuntimeFor, defaultAuthM
 import { lookupProviderSecret } from '../runtime/secret-ids.js'
 import { resolveFleetOauthToken } from '../runtime/claude-headless.js'
 import type { ProviderKind, RuntimeKind } from '../runtime/types.js'
+import { evaluateRoutingGate, readRoutingCalibration, type GateVerdict } from './routing-gate.js'
 
-let cachedMode: { value: RoutingMode; readAt: number } | null = null
+let cachedMode: { configured: RoutingMode; value: RoutingMode; gate: GateVerdict; readAt: number } | null = null
 const MODE_CACHE_MS = 30_000
+let lastGateWarning = ''
 
-export function routingMode(): RoutingMode {
+function readModeState(): NonNullable<typeof cachedMode> {
   const now = Date.now()
-  if (cachedMode && now - cachedMode.readAt < MODE_CACHE_MS) return cachedMode.value
+  if (cachedMode && now - cachedMode.readAt < MODE_CACHE_MS) return cachedMode
   let raw: string | undefined = process.env.MODEL_ROUTING
   if (!raw) {
     try { raw = readEnvFile(['MODEL_ROUTING'])['MODEL_ROUTING'] } catch { raw = undefined }
   }
-  const value = normalizeRoutingMode(raw)
-  cachedMode = { value, readAt: now }
-  return value
+  const configured = normalizeRoutingMode(raw)
+  const gate = evaluateRoutingGate(configured, routingApplies(configured) ? readRoutingCalibration() : null)
+  // An apply mode without passing evidence runs as shadow: rows are still
+  // written (that is how the evidence accrues), nothing is switched.
+  const value: RoutingMode = gate.allowed ? configured : 'shadow'
+  if (!gate.allowed && lastGateWarning !== gate.reason) {
+    lastGateWarning = gate.reason
+    logger.warn({ configured, reason: gate.reason }, 'model-routing: apply mode held at shadow by the measurement gate')
+  }
+  cachedMode = { configured, value, gate, readAt: now }
+  return cachedMode
+}
+
+/** The EFFECTIVE mode: MODEL_ROUTING, held at 'shadow' while the measurement gate is closed. */
+export function routingMode(): RoutingMode {
+  return readModeState().value
+}
+
+/** What the operator configured, and why the effective mode may differ (dashboard). */
+export function routingModeStatus(): { configured: RoutingMode; effective: RoutingMode; gate: GateVerdict } {
+  const s = readModeState()
+  return { configured: s.configured, effective: s.value, gate: s.gate }
 }
 
 /** Test hook: forget the cached mode/key so a changed env is re-read. */
 export function resetRoutingCaches(): void {
   cachedMode = null
+  lastGateWarning = ''
 }
 
 export interface ShadowRouteInput {

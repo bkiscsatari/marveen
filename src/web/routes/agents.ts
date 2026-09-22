@@ -122,7 +122,7 @@ import { isHeadlessAgent, headlessInfo, headlessActivity, readHeadlessTurnLog, i
 import { readAgentModelRouting, writeAgentModelRouting, writeAgentRuntime, writeAgentProvider, resolveAgentRuntimeSpec } from '../agent-config.js'
 import { isRuntimeKind, isProviderKind } from '../../runtime/types.js'
 import { subscriptionRuntimeAvailability } from '../runtime-availability.js'
-import { routingMode } from '../model-routing.js'
+import { routingMode, routingModeStatus } from '../model-routing.js'
 import { detectReauthNeeded } from '../reauth-detect.js'
 import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
 import { readContextGuardConfig, writeContextGuardConfig, seedContextGuardForNewAgent } from '../context-guard-store.js'
@@ -750,7 +750,12 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       // must be `all` for it to actually move (the UI says so when it is not).
       routed: (() => {
         const mapState = readModelProfileMap()
-        return { available: !!mapState && mapState.ok, mapError: mapState && !mapState.ok ? mapState.error : null, mode: routingMode() }
+        const status = routingModeStatus()
+        // Selectable only when the map is usable AND the EFFECTIVE mode is `all`
+        // (i.e. MODEL_ROUTING=all and the measurement gate is open): before that a
+        // routed agent would sit on one profile target without ever being routed.
+        const mapOk = !!mapState && mapState.ok
+        return { available: mapOk && status.effective === 'all', mapError: mapState && !mapState.ok ? mapState.error : null, mode: status.effective, configuredMode: status.configured, gate: status.gate }
       })(),
     })
     return true
@@ -2387,6 +2392,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         const mapState = readModelProfileMap()
         if (!mapState) { json(res, { error: 'No model-profile map is provisioned on this deployment; a Jev-routed agent cannot be started yet (store/model-profile-map.json).' }, 400); return true }
         if (!mapState.ok) { json(res, { error: `Model-profile map is unusable: ${mapState.error}` }, 400); return true }
+        const status = routingModeStatus()
+        if (status.effective !== 'all') {
+          json(res, { error: `Jev-routed agent needs MODEL_ROUTING=all with an open measurement gate (effective mode: ${status.effective}; ${status.gate.reason}).` }, 400); return true
+        }
       }
       writeAgentModelRouting(name, v)
       invalidateHeadlessCache(name)

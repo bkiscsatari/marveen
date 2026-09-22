@@ -353,7 +353,15 @@ export async function startHeadlessAgent(name: string, opts: { fresh?: boolean }
   try { spec = d.buildSpec(name) } catch (err) { return { ok: false, error: `agent spec: ${(err as Error).message}` } }
   const routed = d.readRouting(name) === 'jev'
   let profile: ModelProfileId | null = null
-  if (routed) {
+  // A routed agent moves onto the routine_lowcost target ONLY while routing is
+  // actually applied (effective mode `all`: MODEL_ROUTING=all AND the
+  // measurement gate open). Below that it runs its own configured model --
+  // before this, choosing "Jev-routed" in shadow mode silently downgraded the
+  // agent to the cheapest tier and kept it there, since shadow never reroutes.
+  if (routed && !d.routingAll()) {
+    logger.warn({ agent: name }, 'headless-agents: Jev-routed agent started while routing is not applied -- running its own model')
+    spec = { ...spec, runtime: headlessRuntimeFor(spec.runtime) }
+  } else if (routed) {
     const t = d.initialRoutedTarget()
     if (!t.ok) return { ok: false, error: t.error }
     spec = { ...spec, runtime: headlessRuntimeFor(t.runtime), provider: t.provider, model: t.model }

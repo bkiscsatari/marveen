@@ -52,7 +52,10 @@ describe('pickTarget', () => {
   it('skips when not actionable / needs review / no map', () => {
     expect(pickTarget({ ...ok, actionable: false }, targets, () => true)).toMatchObject({ kind: 'skip', reason: 'not_actionable' })
     expect(pickTarget({ ...ok, profile: null, needsReview: true }, targets, () => true)).toMatchObject({ kind: 'skip', reason: 'needs_review' })
-    expect(pickTarget(ok, { ...targets, analysis_efficient: null }, () => true)).toMatchObject({ kind: 'skip', reason: 'profile_map_missing:analysis_efficient' })
+    // A tier missing from the map climbs like an unavailable one; only no usable
+    // tier at or above the suggestion skips.
+    expect(pickTarget(ok, { ...targets, analysis_efficient: null }, () => true)).toMatchObject({ kind: 'apply', profile: 'build_strong' })
+    expect(pickTarget(ok, { routine_lowcost: targets.routine_lowcost }, () => true)).toMatchObject({ kind: 'skip', reason: 'profile_map_missing:analysis_efficient' })
   })
   it('an unavailable target climbs to the next STRONGER available tier, never weaker', () => {
     const avail = (t: { model: string }) => t.model !== 'deepseek-chat' && t.model !== 'gpt-5.6-sol'
