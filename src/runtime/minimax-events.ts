@@ -15,18 +15,31 @@
 
 import type { ProviderKind, RunResult, RuntimeKind, ToolCallRecord, UsageRecord } from './types.js'
 
+// Recorded live (2026-09-22, subscription): usage = {inputTokens, outputTokens,
+// cacheReadTokens, cacheWriteTokens, totalTokens}; the harness-internal shape
+// {input, output, cacheRead, cacheWrite} is kept as a fallback.
 export interface MinimaxUsage {
   input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number
-  inputTokens?: number; outputTokens?: number
+  inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number
   cost?: { total?: number; input?: number; output?: number }
 }
 
+// Recorded live: toolCall = {id, name, status:<number>, input:{...}}; status
+// climbs 4 -> 5 -> 1 (running) -> 2 (completed). `arguments` kept as fallback.
 export interface MinimaxItem {
   id?: string
   type?: 'reasoning' | 'agent_message' | 'tool_call' | string
   content?: string
   contentDelta?: string
-  toolCall?: { id?: string; name?: string; arguments?: unknown; status?: string | number; [k: string]: unknown }
+  toolCall?: { id?: string; name?: string; input?: unknown; arguments?: unknown; status?: string | number; [k: string]: unknown }
+}
+
+export function toolCallOk(status: string | number | undefined): boolean | undefined {
+  if (status === undefined || status === null || status === '') return undefined
+  const st = String(status).toLowerCase()
+  if (st === '2' || /complet|succ|done/.test(st)) return true
+  if (st === '3' || /fail|error|cancel|reject/.test(st)) return false
+  return undefined
 }
 
 export interface MinimaxExecResult {
@@ -119,8 +132,7 @@ export class MinimaxStreamAccumulator {
           if (text) s.reasoning.push(text)
         } else if (it.type === 'tool_call') {
           const tc = it.toolCall ?? {}
-          const st = String(tc.status ?? '').toLowerCase()
-          s.toolCalls.push({ name: minimaxToolName(tc.name), input: tc.arguments, ok: st ? !/fail|error|cancel/.test(st) : undefined })
+          s.toolCalls.push({ name: minimaxToolName(tc.name), input: tc.input ?? tc.arguments, ok: toolCallOk(tc.status) })
         }
         break
       }
@@ -162,10 +174,10 @@ export class MinimaxStreamAccumulator {
 
 export function usageFromMinimax(u: MinimaxUsage | null, ctx: { runtime: RuntimeKind; provider: ProviderKind; model: string; timestamp: number; sessionId?: string | null }): UsageRecord {
   return {
-    inputTokens: Number(u?.input ?? u?.inputTokens) || 0,
-    outputTokens: Number(u?.output ?? u?.outputTokens) || 0,
-    cacheReadTokens: Number(u?.cacheRead) || 0,
-    cacheCreationTokens: Number(u?.cacheWrite) || 0,
+    inputTokens: Number(u?.inputTokens ?? u?.input) || 0,
+    outputTokens: Number(u?.outputTokens ?? u?.output) || 0,
+    cacheReadTokens: Number(u?.cacheReadTokens ?? u?.cacheRead) || 0,
+    cacheCreationTokens: Number(u?.cacheWriteTokens ?? u?.cacheWrite) || 0,
     thinkingTokens: 0,
     model: ctx.model, provider: ctx.provider, runtime: ctx.runtime,
     costUsd: typeof u?.cost?.total === 'number' && u.cost.total > 0 ? u.cost.total : undefined,

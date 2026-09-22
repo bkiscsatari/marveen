@@ -44,6 +44,32 @@ describe('minimax-events: text-ok.jsonl (source-derived)', () => {
   })
 })
 
+describe('minimax-events: recorded live (subscription, mcode 0.5.1)', () => {
+  it('tool-read: reasoning + numeric-status tool call with `input`, message, live usage keys, exec.result session id', () => {
+    const s = feed('recorded-tool-read.jsonl')
+    expect(s.sessionId).toMatch(/^mvs_/)
+    expect(s.messages).toEqual(['marveen-probe-42'])
+    expect(s.reasoning.length).toBeGreaterThanOrEqual(1)
+    expect(s.toolCalls).toHaveLength(1)
+    expect(s.toolCalls[0].name).toBe('Read')
+    expect(s.toolCalls[0].ok).toBe(true)
+    expect(JSON.stringify(s.toolCalls[0].input)).toContain('secret-number.txt')
+    const r = minimaxSummaryToRunResult(s, { ...CTX, exitCode: 0 })
+    expect(r.blocked).toBe(false)
+    expect(r.text).toBe('marveen-probe-42')
+    expect(r.usage).toMatchObject({ outputTokens: 114, cacheReadTokens: 23612, cacheCreationTokens: 426 })
+    expect(r.sessionRef).toBe(s.sessionId)
+  })
+  it('resume: same session id as the tool run, answers "42"', () => {
+    const a = feed('recorded-tool-read.jsonl'); const b = feed('recorded-resume.jsonl')
+    expect(b.sessionId).toBe(a.sessionId)
+    expect(minimaxSummaryToRunResult(b, CTX).text).toBe('42')
+  })
+  it('probe-ok: plain OK reply', () => {
+    expect(minimaxSummaryToRunResult(feed('recorded-probe-ok.jsonl'), CTX).text).toMatch(/\bOK\b/)
+  })
+})
+
 describe('minimax-events: failure shapes', () => {
   it('auth-less run: empty stdout, exit 3, stderr hint -> blocked + auth', () => {
     const acc = new MinimaxStreamAccumulator()
