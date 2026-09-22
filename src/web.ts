@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { runLsof } from './lsof.js'
+import { processCwd, portReclaimAllowed } from './port-reclaim.js'
 import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
@@ -289,6 +290,15 @@ export function startWebServer(port = 3420): http.Server {
           }
           if (!/node|tsx/i.test(cmd)) {
             logger.warn({ port, pid, cmd }, 'Port held by non-node process -- refusing to kill')
+            continue
+          }
+          // Only OUR install's dashboard may be reclaimed. A dev clone started on
+          // the live port (WEB_PORT not in its .env) used to SIGTERM the live
+          // dashboard -- same user, same node binary -- and take it down.
+          const cwd = processCwd(pid)
+          const verdict = portReclaimAllowed(cwd, PROJECT_ROOT)
+          if (!verdict.ok) {
+            logger.error({ port, pid, cwd, projectRoot: PROJECT_ROOT, reason: verdict.reason }, 'Port held by ANOTHER install\'s dashboard -- refusing to kill it (check WEB_PORT in this install\'s .env)')
             continue
           }
           victims.push(pid)
