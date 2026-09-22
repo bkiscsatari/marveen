@@ -17,6 +17,7 @@ import {
   startHeadlessAgent,
   stopHeadlessAgent,
   sendToHeadlessAgent,
+  headlessReady,
 } from './headless-agents.js'
 import {
   paneLooksIdle,
@@ -3027,7 +3028,8 @@ export async function isSessionReadyForPrompt(session: string, host: string | nu
   // are NOT "not ready" -- the next task must be allowed to try again (and
   // to fail loudly into the log) instead of stranding as pending forever.
   const headless = headlessAgentForSession(session)
-  if (headless) return headlessState(headless) !== 'busy' && headlessRunning(headless)
+  // Ready = nothing in flight AND nothing queued (a queued turn used to read as ready).
+  if (headless) return headlessReady(headless)
   // Dim-ghost tolerant idle read: CC >=2.1.202 paints a dim placeholder into
   // the empty input box, which a plain capture reads as parked text. Only when
   // the plain view says 'typing' do we pay for the second (-e, dim-stripped)

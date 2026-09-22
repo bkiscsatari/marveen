@@ -37,7 +37,9 @@
 // headless: a target that names claude-tmux is run as claude-headless (same
 // Claude subscription, no TUI), so the loop never has to respawn a pane.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, renameSync, openSync, readSync, fstatSync, closeSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { scrubSecrets } from '../model-router.js'
 import { join } from 'node:path'
 import { MAIN_AGENT_ID, STORE_DIR } from '../config.js'
 import { logger } from '../logger.js'
@@ -84,6 +86,8 @@ interface Entry {
   turns: number
   /** One alert per blocked/auth episode, not one per turn. */
   alertedFor: HeadlessState | null
+  /** Aborts the in-flight CLI run on stop (its whole process group). */
+  abort: AbortController
 }
 
 interface PersistedAgent {
@@ -248,26 +252,87 @@ function forgetPersisted(storeDir: string, name: string): void {
   } catch { /* best effort */ }
 }
 
+// The turn log grew forever and was read whole on every activity poll: it is
+// rotated at LOG_ROTATE_BYTES (one .1 generation kept) and read from the tail.
+// Prompts and outputs are secret-scrubbed before they are written.
+export const LOG_ROTATE_BYTES = 5 * 1024 * 1024
+const LOG_TAIL_BYTES = 512 * 1024
+
 function appendLog(storeDir: string, name: string, entry: HeadlessTurnLogEntry): void {
   try {
     mkdirSync(join(storeDir, 'headless-agents'), { recursive: true })
-    appendFileSync(logFile(storeDir, name), JSON.stringify(entry) + '\n', 'utf-8')
+    const p = logFile(storeDir, name)
+    try { if (statSync(p).size > LOG_ROTATE_BYTES) renameSync(p, `${p}.1`) } catch { /* no file yet */ }
+    appendFileSync(p, JSON.stringify({ ...entry, text: scrubSecrets(entry.text), ...(entry.reason ? { reason: scrubSecrets(entry.reason) } : {}) }) + '\n', 'utf-8')
   } catch (err) {
     logger.debug({ err, agent: name }, 'headless-agents: turn log append failed')
   }
+}
+
+function readTail(p: string, bytes: number): string {
+  const fd = openSync(p, 'r')
+  try {
+    const size = fstatSync(fd).size
+    const len = Math.min(size, bytes)
+    const buf = Buffer.alloc(len)
+    readSync(fd, buf, 0, len, size - len)
+    const s = buf.toString('utf-8')
+    return len < size ? s.slice(s.indexOf('\n') + 1) : s // drop a partial first line
+  } finally { closeSync(fd) }
 }
 
 export function readHeadlessTurnLog(name: string, limit = 50, storeDir: string = deps?.storeDir() ?? STORE_DIR): HeadlessTurnLogEntry[] {
   try {
     const p = logFile(storeDir, name)
     if (!existsSync(p)) return []
-    const lines = readFileSync(p, 'utf-8').split('\n').filter(Boolean)
+    const lines = readTail(p, LOG_TAIL_BYTES).split('\n').filter(Boolean)
     return lines.slice(-Math.max(1, limit)).map((l) => {
       try { return JSON.parse(l) as HeadlessTurnLogEntry } catch { return null }
     }).filter((x): x is HeadlessTurnLogEntry => x !== null)
   } catch {
     return []
   }
+}
+
+// ---- durable turn journal -------------------------------------------------------
+//
+// The message router treats 'sent' as delivered, but the turn used to live only
+// in an in-memory promise chain: a dashboard crash lost queued and in-flight
+// turns while the DB said "delivered". Every accepted turn is now journalled in
+// store/headless-agents/<name>.queue.json until it completes:
+//   queued   -- accepted, not started;
+//   running  -- started; if found at the next start, the run was interrupted
+//               and is replayed WITH a note, so the agent does not blindly
+//               repeat side effects it may already have performed;
+//   deferred -- blocked by auth/quota; replayed at the next start (the owner
+//               fixes the login and restarts the agent, as the alert says).
+
+export interface JournalTurn { id: string; text: string; enqueuedAt: number; state: 'queued' | 'running' | 'deferred'; attempts: number }
+
+export const INTERRUPTED_NOTE =
+  '[Marveen: ez a feladat egy korábbi, megszakadt körből jön vissza (a dashboard vagy az agent újraindult futás közben). ' +
+  'Ha egy részét már elvégezted, ne ismételd meg -- előbb ellenőrizd, mi történt meg.]\n\n'
+
+function journalFile(storeDir: string, name: string): string { return join(storeDir, 'headless-agents', `${name.replace(/[^A-Za-z0-9_-]/g, '_')}.queue.json`) }
+
+export function readJournal(storeDir: string, name: string): JournalTurn[] {
+  try {
+    const raw = JSON.parse(readFileSync(journalFile(storeDir, name), 'utf-8')) as unknown
+    return Array.isArray(raw) ? raw.filter((t): t is JournalTurn => !!t && typeof (t as JournalTurn).id === 'string' && typeof (t as JournalTurn).text === 'string') : []
+  } catch { return [] }
+}
+
+function writeJournal(storeDir: string, name: string, turns: JournalTurn[]): void {
+  try {
+    mkdirSync(join(storeDir, 'headless-agents'), { recursive: true })
+    atomicWriteFileSync(journalFile(storeDir, name), JSON.stringify(turns, null, 2) + '\n', { mode: 0o600 })
+  } catch (err) {
+    logger.warn({ err, agent: name }, 'headless-agents: could not persist the turn journal')
+  }
+}
+
+function journalUpdate(storeDir: string, name: string, fn: (turns: JournalTurn[]) => JournalTurn[]): void {
+  writeJournal(storeDir, name, fn(readJournal(storeDir, name)))
 }
 
 // ---- routed target resolution -----------------------------------------------
@@ -382,10 +447,20 @@ export async function startHeadlessAgent(name: string, opts: { fresh?: boolean }
     name, spec, runtime, routed, profile,
     startedAt: Math.floor(d.now() / 1000),
     resumeToken, chain: Promise.resolve(), inFlight: 0, queued: 0, state: 'idle',
-    lastResult: null, lastTurnAt: null, lastError: null, turns: 0, alertedFor: null,
+    lastResult: null, lastTurnAt: null, lastError: null, turns: 0, alertedFor: null, abort: new AbortController(),
   }
   entries.set(name, e)
   persist(storeDir, e)
+  // Replay what the journal still holds (a crash, a stop, or an auth/quota
+  // block); a turn caught 'running' was interrupted and carries a note.
+  const pending = opts.fresh ? [] : readJournal(storeDir, name)
+  if (opts.fresh) writeJournal(storeDir, name, [])
+  if (pending.length) {
+    const replay = pending.map((t) => ({ ...t, state: 'queued' as const, text: t.state === 'running' && !t.text.startsWith(INTERRUPTED_NOTE) ? INTERRUPTED_NOTE + t.text : t.text }))
+    writeJournal(storeDir, name, replay)
+    for (const t of replay) enqueue(d, e, t)
+    logger.warn({ agent: name, replayed: replay.length }, 'headless-agents: replaying journalled turns')
+  }
   logger.info({ agent: name, runtime: spec.runtime, model: spec.model, routed, resume: !!resumeToken, fresh: !!opts.fresh }, 'headless-agents: session started')
   return { ok: true }
 }
@@ -395,9 +470,12 @@ export async function stopHeadlessAgent(name: string): Promise<{ ok: boolean; er
   if (!e) return { ok: false, error: 'Agent is not running' }
   entries.delete(name)
   // The resume token stays on disk: a later non-fresh start continues the
-  // conversation, a fresh start (or a runtime change) drops it. An in-flight
-  // turn finishes on its own, bounded by the adapter's timeout; its result is
-  // ignored because the entry is gone.
+  // conversation, a fresh start (or a runtime change) drops it. The in-flight
+  // run is ABORTED (its process group terminated): before, it kept running
+  // unobserved, and a quick restart resumed the same session in a second
+  // process. Its journal entry stays 'running', so the next start replays it
+  // with the interruption note.
+  e.abort.abort()
   logger.info({ agent: name, runtime: e.spec.runtime, inFlight: e.inFlight }, 'headless-agents: session stopped')
   return { ok: true }
 }
@@ -420,6 +498,21 @@ function classify(r: RunResult): HeadlessState {
   return 'idle'
 }
 
+export const MAX_QUEUED_TURNS = 20
+
+/** Ready for a new prompt: running, nothing in flight AND nothing queued (the router's readiness gate). */
+export function headlessReady(name: string): boolean {
+  const e = entries.get(name)
+  return !!e && e.inFlight === 0 && e.queued === 0
+}
+
+function enqueue(d: Deps, e: Entry, turn: JournalTurn): void {
+  e.queued++
+  e.chain = e.chain
+    .then(() => runTurn(d, e, turn))
+    .catch((err) => { logger.error({ err, agent: e.name }, 'headless-agents: turn crashed') })
+}
+
 export async function sendToHeadlessAgent(
   name: string,
   text: string,
@@ -428,11 +521,13 @@ export async function sendToHeadlessAgent(
   const e = entries.get(name)
   if (!e) throw new Error(`headless agent ${name} is not running`)
   if (opts.onBusyTimeout === 'abort' && (e.inFlight > 0 || e.queued > 0)) return 'aborted-busy'
+  // Back-pressure: the router keeps the message pending and retries later.
+  if (e.queued >= MAX_QUEUED_TURNS) return 'aborted-busy'
   const d = await getDeps()
-  e.queued++
-  e.chain = e.chain
-    .then(() => runTurn(d, e, text))
-    .catch((err) => { logger.error({ err, agent: name }, 'headless-agents: turn crashed') })
+  const turn: JournalTurn = { id: `${d.now()}-${randomBytes(3).toString('hex')}`, text, enqueuedAt: d.now(), state: 'queued', attempts: 0 }
+  // Journalled BEFORE 'sent' is returned: 'sent' now means persisted.
+  journalUpdate(d.storeDir(), name, (ts) => [...ts, turn])
+  enqueue(d, e, turn)
   return 'sent'
 }
 
@@ -468,21 +563,25 @@ async function maybeReroute(d: Deps, e: Entry, text: string): Promise<void> {
   logger.info({ agent: e.name, from, to: `${e.spec.runtime}/${e.spec.model}`, profile: e.profile }, 'headless-agents: Jev switched the target for the next turn')
 }
 
-async function runTurn(d: Deps, e: Entry, text: string): Promise<void> {
+async function runTurn(d: Deps, e: Entry, turn: JournalTurn): Promise<void> {
   e.queued--
-  if (!entries.has(e.name) || entries.get(e.name) !== e) return // stopped while queued
+  if (!entries.has(e.name) || entries.get(e.name) !== e) return // stopped while queued: stays journalled
   const storeDir = d.storeDir()
+  const text = turn.text
+  // Busy BEFORE the routing call: the readiness gate must not see an idle
+  // agent while a turn is already being prepared.
+  e.inFlight++
+  e.state = 'busy'
+  journalUpdate(storeDir, e.name, (ts) => ts.map((t) => (t.id === turn.id ? { ...t, state: 'running', attempts: t.attempts + 1 } : t)))
   try {
     await maybeReroute(d, e, text)
   } catch (err) {
     logger.warn({ err, agent: e.name }, 'headless-agents: routing failed, running on the current target')
   }
-  e.inFlight++
-  e.state = 'busy'
   appendLog(storeDir, e.name, { ts: d.now(), dir: 'in', runtime: e.spec.runtime, model: e.spec.model, profile: e.profile, text: text.slice(0, 4000) })
   try {
-    const r = await e.runtime.run(e.spec, text, { resume: e.resumeToken ?? undefined, allowTools: true, timeoutAsError: true })
-    if (!entries.has(e.name) || entries.get(e.name) !== e) return
+    const r = await e.runtime.run(e.spec, text, { resume: e.resumeToken ?? undefined, allowTools: true, timeoutAsError: true, signal: e.abort.signal })
+    if (!entries.has(e.name) || entries.get(e.name) !== e) return // stopped mid-turn: stays 'running' in the journal
     e.lastResult = r
     e.lastTurnAt = d.now()
     e.turns++
@@ -493,11 +592,14 @@ async function runTurn(d: Deps, e: Entry, text: string): Promise<void> {
       ts: d.now(), dir: r.blocked ? 'error' : 'out', runtime: e.spec.runtime, model: e.spec.model, profile: e.profile,
       text: (r.text ?? (r.reason ?? '')).slice(0, 4000), blocked: r.blocked, reason: r.reason,
     })
+    // Done -> out of the journal; an auth/quota block -> deferred, replayed at the next start.
+    if (e.state === 'auth' || e.state === 'blocked') journalUpdate(storeDir, e.name, (ts) => ts.map((t) => (t.id === turn.id ? { ...t, state: 'deferred' } : t)))
+    else journalUpdate(storeDir, e.name, (ts) => ts.filter((t) => t.id !== turn.id))
     if (e.state !== 'idle' && e.alertedFor !== e.state) {
       e.alertedFor = e.state
       d.notifyMain(
         `[runtime] ${e.name} (${e.spec.runtime}/${e.spec.model}) ${e.state === 'auth' ? 'nincs bejelentkezve / hitelesítési hiba' : 'kvóta- vagy limit-hiba'}: ${(r.reason ?? '').slice(0, 300)}. ` +
-        `A feladat nem futott le; ellenőrizd a runtime loginját vagy a kulcsát, majd indítsd újra az agentet.`,
+        `A feladat nem futott le, de megmaradt: az agent újraindításakor automatikusan újra lefut. Ellenőrizd a runtime loginját vagy a kulcsát, majd indítsd újra az agentet.`,
       )
     } else if (e.state === 'idle') {
       e.alertedFor = null
@@ -506,6 +608,8 @@ async function runTurn(d: Deps, e: Entry, text: string): Promise<void> {
   } catch (err) {
     e.state = 'idle'
     e.lastError = (err as Error).message
+    // A throw is a bug or an unavailable runtime, not an answer: keep the turn for the next start.
+    journalUpdate(storeDir, e.name, (ts) => ts.map((t) => (t.id === turn.id ? { ...t, state: 'deferred' } : t)))
     appendLog(storeDir, e.name, { ts: d.now(), dir: 'error', runtime: e.spec.runtime, model: e.spec.model, profile: e.profile, text: `run threw: ${(err as Error).message}` })
     logger.error({ err, agent: e.name }, 'headless-agents: run threw')
   } finally {
