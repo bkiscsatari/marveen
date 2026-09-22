@@ -86,6 +86,18 @@ describe('edge cases', () => {
     expect(r.text).toBeNull()
     expect(r.reason).toMatch(/without an agent_message/)
   })
+  it('turn completed with errors and NO agent message is a silent failure -> blocked (observed live: 401 retries then turn.completed)', () => {
+    const acc = new CodexStreamAccumulator()
+    acc.push('{"type":"thread.started","thread_id":"t1"}')
+    acc.push('{"type":"error","message":"unexpected status 401 Unauthorized: Missing bearer"}')
+    acc.push('{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}')
+    const r = codexSummaryToRunResult(acc.summary(), CTX)
+    expect(r.blocked).toBe(true)
+    expect(r.text).toBeNull()
+    expect(r.reason).toMatch(/without agent_message but with errors/)
+    expect(r.reason).toMatch(/401/)
+    expect(codexShowsAuthFailure(acc.summary())).toBe(true)
+  })
   it('item tool-name mapping', () => {
     expect(codexItemToolName({ type: 'file_change' })).toBe('Edit')
     expect(codexItemToolName({ type: 'mcp_tool_call', server: 'marveen-channel', tool: 'reply' })).toBe('mcp__marveen-channel__reply')

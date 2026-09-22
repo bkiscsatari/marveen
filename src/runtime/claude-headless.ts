@@ -30,6 +30,7 @@ import { contextLimitForModel } from '../context-guard.js'
 import { resolveProviderEnvVars } from './anthropic-compat-env.js'
 import { lookupProviderSecret } from './secret-ids.js'
 import { ClaudeStreamAccumulator, streamShowsAuthFailure, summaryToRunResult, type RateLimitInfo } from './stream-json.js'
+import { streamDumper } from './stream-dump.js'
 import type {
   AgentHandle, AgentRuntime, AgentSpec, AgentState, HealthProbeResult, RunOptions, RunResult,
   RuntimeCapabilities, SendOptions, SendOutcome, UsageCursor, UsageRecord,
@@ -222,6 +223,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onR
   const timeoutMs = opts.timeoutMs ?? DEFAULT_HEADLESS_TIMEOUT_MS
   const startedAt = Date.now()
   const acc = new ClaudeStreamAccumulator({ onText: opts.onProgress })
+  const dump = streamDumper('claude-headless', spec.id)
   let stderrTail = ''
   let timedOut = false
 
@@ -243,6 +245,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onR
     }, timeoutMs)
     const rl = createInterface({ input: child.stdout })
     rl.on('line', (line) => {
+      dump?.(line)
       const ev = acc.push(line)
       if (ev && ev.type === 'rate_limit_event' && opts.onRateLimit) {
         const info = (ev as { rate_limit_info?: RateLimitInfo }).rate_limit_info

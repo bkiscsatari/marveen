@@ -30,6 +30,7 @@ import { PROJECT_ROOT } from '../config.js'
 import { contextLimitForModel } from '../context-guard.js'
 import { lookupProviderSecret } from './secret-ids.js'
 import { CodexStreamAccumulator, codexShowsAuthFailure, codexSummaryToRunResult } from './codex-events.js'
+import { streamDumper } from './stream-dump.js'
 import {
   renderCodexConfigToml, renderCodexHooksJson, renderInstructionsMd,
   type ClaudeHooksConfig, type CodexSandboxMode, type McpServerDef,
@@ -220,6 +221,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
   const timeoutMs = opts.timeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS
   const startedAt = Date.now()
   const acc = new CodexStreamAccumulator({ onText: opts.onProgress })
+  const dump = streamDumper('codex-cli', spec.id)
   let stderrTail = ''
   let timedOut = false
 
@@ -234,7 +236,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
       try { child.kill('SIGTERM') } catch { /* gone */ }
       setTimeout(() => { try { child.kill('SIGKILL') } catch { /* gone */ } }, KILL_GRACE_MS).unref()
     }, timeoutMs)
-    createInterface({ input: child.stdout }).on('line', (line) => { acc.push(line) })
+    createInterface({ input: child.stdout }).on('line', (line) => { dump?.(line); acc.push(line) })
     child.stderr.on('data', (d: Buffer) => { stderrTail = (stderrTail + d.toString()).slice(-2000) })
     child.on('error', (err) => { stderrTail += ` spawn error: ${err.message}`; clearTimeout(timer); resolve(null) })
     child.on('close', (code) => { clearTimeout(timer); resolve(code) })

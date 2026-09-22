@@ -193,10 +193,15 @@ export function codexSummaryToRunResult(
 ): RunResult {
   const usage = usageFromCodex(s.usage, { ...ctx, timestamp: ctx.timestamp ?? Date.now(), threadId: s.threadId })
   const last = s.messages[s.messages.length - 1] ?? null
-  if (s.turnFailed !== null || s.turnsCompleted === 0) {
+  // A turn that "completed" with errors and no agent_message is a failure in
+  // disguise (observed 2026-09-22: 401 retries, then turn.completed with zero
+  // usage and no message) -- never hand that to a caller as a clean empty run.
+  const silentFailure = last === null && s.errors.length > 0
+  if (s.turnFailed !== null || s.turnsCompleted === 0 || silentFailure) {
     const bits: string[] = []
     if (s.turnFailed !== null) bits.push(`turn.failed=${s.turnFailed.slice(0, 300)}`)
-    else bits.push('no turn.completed event')
+    else if (s.turnsCompleted === 0) bits.push('no turn.completed event')
+    else bits.push('turn.completed without agent_message but with errors')
     if (s.errors.length) bits.push(`errors=${s.errors.slice(-2).join('; ').slice(0, 300)}`)
     if (ctx.exitCode !== undefined && ctx.exitCode !== null && ctx.exitCode !== 0) bits.push(`exit=${ctx.exitCode}`)
     if (ctx.stderrTail) bits.push(`stderr=${ctx.stderrTail.slice(-300)}`)
