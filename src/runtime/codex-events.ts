@@ -89,13 +89,18 @@ export interface CodexSummary {
   turnFailed: string | null
   /** Top-level `error` events and error items (transport retries, 401s, ...). */
   errors: string[]
+  /** Informational error-typed items that are not failures (e.g. the
+   *  `--dangerously-bypass-hook-trust` notice, observed live 2026-09-22). */
+  warnings: string[]
   malformedLines: number
 }
+
+const WARNING_ITEM_RX = /--dangerously-bypass-hook-trust.*is enabled|Enabled hooks may run without review/i
 
 export class CodexStreamAccumulator {
   private s: CodexSummary = {
     threadId: null, messages: [], reasoning: [], toolCalls: [], usage: null,
-    turnsCompleted: 0, turnFailed: null, errors: [], malformedLines: 0,
+    turnsCompleted: 0, turnFailed: null, errors: [], warnings: [], malformedLines: 0,
   }
   private seenCompletedItems = new Set<string>()
   private onText?: (chunk: string) => void
@@ -142,7 +147,9 @@ export class CodexStreamAccumulator {
         } else if (item.type === 'reasoning' && typeof item.text === 'string') {
           s.reasoning.push(item.text)
         } else if (item.type === 'error') {
-          s.errors.push(item.message ?? 'error item')
+          const msg = item.message ?? 'error item'
+          if (WARNING_ITEM_RX.test(msg)) s.warnings.push(msg)
+          else s.errors.push(msg)
         } else {
           const name = codexItemToolName(item)
           if (name) {
@@ -196,12 +203,17 @@ export function codexSummaryToRunResult(
   // A turn that "completed" with errors and no agent_message is a failure in
   // disguise (observed 2026-09-22: 401 retries, then turn.completed with zero
   // usage and no message) -- never hand that to a caller as a clean empty run.
-  const silentFailure = last === null && s.errors.length > 0
+  // Likewise a turn that completed with NO message and NO tokens at all did
+  // not reach the model (observed: no login -> zero usage, no message, exit 0).
+  const zeroUsage = !s.usage || ((Number(s.usage.input_tokens) || 0) + (Number(s.usage.output_tokens) || 0)) === 0
+  const silentFailure = last === null && (s.errors.length > 0 || zeroUsage)
   if (s.turnFailed !== null || s.turnsCompleted === 0 || silentFailure) {
     const bits: string[] = []
     if (s.turnFailed !== null) bits.push(`turn.failed=${s.turnFailed.slice(0, 300)}`)
     else if (s.turnsCompleted === 0) bits.push('no turn.completed event')
-    else bits.push('turn.completed without agent_message but with errors')
+    else if (s.errors.length > 0) bits.push('turn.completed without agent_message but with errors')
+    else bits.push('turn.completed with no agent_message and zero token usage (model never reached -- login/key missing?)')
+    if (s.warnings.length) bits.push(`warnings=${s.warnings.length}`)
     if (s.errors.length) bits.push(`errors=${s.errors.slice(-2).join('; ').slice(0, 300)}`)
     if (ctx.exitCode !== undefined && ctx.exitCode !== null && ctx.exitCode !== 0) bits.push(`exit=${ctx.exitCode}`)
     if (ctx.stderrTail) bits.push(`stderr=${ctx.stderrTail.slice(-300)}`)
