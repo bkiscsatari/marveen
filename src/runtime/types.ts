@@ -94,6 +94,8 @@ export interface AgentSpec {
   provider: ProviderKind
   authMode: AuthMode
   securityProfile: string
+  /** From templates/profiles/<securityProfile>.json: 'strict' = allow-list only. Adapters map it onto their own sandbox/approval knobs. */
+  permissionMode?: 'permissive' | 'strict'
   displayName?: string
   channelProvider?: string | null
   /** MCP servers injected by Marveen itself (e.g. the Telegram bridge), merged over the agent's .mcp.json in every runtime. */

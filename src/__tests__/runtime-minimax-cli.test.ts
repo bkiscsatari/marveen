@@ -4,7 +4,10 @@ import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { MinimaxStreamAccumulator, minimaxSummaryToRunResult, minimaxShowsAuthFailure, minimaxToolName, parseMinimaxLine } from '../runtime/minimax-events.js'
-import { buildMinimaxArgs, buildMinimaxEnv, mcodeModelId, permissionForProfile, renderMinimaxConfigYaml, renderClaudePluginForHooks, prepareMinimaxBundle, minimaxCliRuntime } from '../runtime/minimax-cli.js'
+import { buildMinimaxArgs, buildMinimaxEnv, mcodeModelId, permissionForProfile, renderMinimaxConfigYaml, renderClaudePluginForHooks, prepareMinimaxBundle, minimaxCliRuntime, pluginNameFor, removeOwnLegacyPlugin } from '../runtime/minimax-cli.js'
+import { SERVICE_ID } from '../config.js'
+// @ts-expect-error -- plain .mjs hook script, no types
+import { belongsTo } from '../../scripts/hooks/shim/scope-hook.mjs'
 import { resolveRuntimeSpec, defaultRuntimeFor, runtimeSupportsProvider } from '../runtime/resolve-spec.js'
 import type { AgentSpec } from '../runtime/types.js'
 
@@ -155,11 +158,18 @@ describe('prepareMinimaxBundle (temp agent dir + temp MINIMAX_DATA_DIR, no plugi
       expect(readFileSync(b.configPath, 'utf-8')).toContain('minimax/MiniMax-M3')
       const mcp = JSON.parse(readFileSync(join(dir, '.mcp.json'), 'utf-8'))
       expect(Object.keys(mcp.mcpServers).sort()).toEqual(['gmail', 'plugin_telegram_bridge'])
-      expect(b.pluginName).toBe('marveen-hooks-scout')
-      expect(b.pluginDir).toBe(join(tmp, 'data', 'plugins', 'marveen-hooks-scout'))
+      // Named per install + agent, so a dev clone cannot overwrite the live agent's plugin.
+      expect(b.pluginName).toBe(pluginNameFor('scout', SERVICE_ID))
+      expect(b.pluginName).not.toBe('marveen-hooks-scout')
+      expect(b.pluginDir).toBe(join(tmp, 'data', 'plugins', b.pluginName!))
       expect(existsSync(join(b.pluginDir!, '.claude-plugin', 'plugin.json'))).toBe(true)
       const hooks = JSON.parse(readFileSync(join(b.pluginDir!, 'hooks', 'hooks.json'), 'utf-8'))
-      expect(hooks.hooks.PreToolUse[0].hooks[0].command).toBe('node /x/egress-gate.mjs')
+      // Scoped: the original command runs through scope-hook.mjs for THIS agent dir only.
+      const cmd: string = hooks.hooks.PreToolUse[0].hooks[0].command
+      expect(cmd).toContain('scope-hook.mjs')
+      const [, dirB64, cmdB64] = cmd.match(/b64:(\S+) b64:(\S+)$/)!
+      expect(Buffer.from(dirB64, 'base64').toString()).toBe(dir)
+      expect(Buffer.from(cmdB64, 'base64').toString()).toBe('node /x/egress-gate.mjs')
       expect(b.skippedHooks).toEqual([])
     } finally { if (prev === undefined) delete process.env.MINIMAX_DATA_DIR; else process.env.MINIMAX_DATA_DIR = prev }
   })
@@ -178,5 +188,26 @@ describe('runtime axes: minimax subscription -> minimax-cli, api stays on the Cl
     const caps = minimaxCliRuntime.capabilities({ id: 'x', dir: '/tmp/x', role: 'sub', model: 'minimax-m3', runtime: 'minimax-cli', provider: 'minimax', authMode: 'subscription', securityProfile: 'default' })
     expect(caps).toMatchObject({ interactive: false, supportsHooks: 'native', supportsMcp: true, reportsUsage: 'events', contextWindow: 1_000_000 })
     expect(await minimaxCliRuntime.state({ agentId: 'x', runtime: 'minimax-cli', sessionRef: 'minimax:x:nope' })).toBe('dead')
+  })
+})
+
+describe('global mcode plugins are scoped per agent and per install', () => {
+  it('scope-hook: a call from another agent dir is skipped; no cwd = run (fail toward enforcement)', () => {
+    const a = join(tmp, 'agents', 'scout')
+    expect(belongsTo(a, a)).toBe(true)
+    expect(belongsTo(a, join(a, 'sub'))).toBe(true)
+    expect(belongsTo(a, join(tmp, 'agents', 'scout2'))).toBe(false)
+    expect(belongsTo(a, join(tmp, 'agents', 'argus'))).toBe(false)
+    expect(belongsTo(a, undefined)).toBe(true)
+  })
+
+  it('removes only THIS install\'s legacy unscoped plugin', () => {
+    const data = join(tmp, 'legacy-data')
+    const mk = (name: string, body: string) => { mkdirSync(join(data, 'plugins', name, 'hooks'), { recursive: true }); writeFileSync(join(data, 'plugins', name, 'hooks', 'hooks.json'), body) }
+    mk('marveen-hooks-scout', '{"hooks":{"PreToolUse":[{"hooks":[{"command":"python3 /srv/live/scripts/hooks/x.py"}]}]}}')
+    expect(removeOwnLegacyPlugin('marveen-hooks-scout', '/srv/live-agnostic', data)).toBe(false) // a prefix-alike install is not the owner
+    expect(existsSync(join(data, 'plugins', 'marveen-hooks-scout'))).toBe(true)
+    expect(removeOwnLegacyPlugin('marveen-hooks-scout', '/srv/live', data)).toBe(true)
+    expect(existsSync(join(data, 'plugins', 'marveen-hooks-scout'))).toBe(false)
   })
 })

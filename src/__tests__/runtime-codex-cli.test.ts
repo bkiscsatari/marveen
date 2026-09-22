@@ -47,8 +47,8 @@ describe('buildCodexEnv', () => {
 })
 
 describe('sandboxForProfile', () => {
-  it('strict permission mode -> read-only; otherwise workspace-write', () => {
-    expect(sandboxForProfile('researcher', 'strict')).toBe('read-only')
+  it('every profile writes only inside its workspace (strict is enforced by hooks, not a read-only sandbox)', () => {
+    expect(sandboxForProfile('developer-junior', 'strict')).toBe('workspace-write')
     expect(sandboxForProfile('researcher', 'permissive')).toBe('workspace-write')
     expect(sandboxForProfile('developer-junior', undefined)).toBe('workspace-write')
   })

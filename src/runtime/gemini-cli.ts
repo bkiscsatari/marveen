@@ -114,12 +114,45 @@ export function prepareGeminiBundle(spec: AgentSpec, opts: { hooksEnabled?: bool
 interface GeminiSession { spec: AgentSpec; hasHistory: boolean; chain: Promise<unknown>; inFlight: number; lastResult: RunResult | null; usage: UsageRecord[]; authFailed: boolean }
 const sessions = new Map<string, GeminiSession>()
 
+// Gemini CLI resumes only "latest" (or a list index) per PROJECT = cwd; it has
+// no id-based resume. Two consequences, both handled here:
+//   1. runs in the same cwd are serialised (two concurrent `-r latest` runs
+//      would fork the same parent session);
+//   2. a resume is honoured only when the latest session in that cwd is still
+//      the one the caller asks for -- a background one-shot that ran in the
+//      agent dir in between would otherwise be the conversation the next chat
+//      turn continues. Then a fresh session starts instead, loudly.
+const cwdChains = new Map<string, Promise<unknown>>()
+const latestSessionByCwd = new Map<string, string>()
+
+export function withCwdLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
+  const prev = cwdChains.get(cwd) ?? Promise.resolve()
+  const next = prev.catch(() => undefined).then(fn)
+  cwdChains.set(cwd, next.catch(() => undefined))
+  return next
+}
+
+/** Pure: may this run pass `-r latest`? */
+export function geminiResumeDecision(wanted: string | undefined, latestInCwd: string | undefined, resumeLatest: boolean | undefined): { resume: boolean; reason?: string } {
+  if (wanted) {
+    if (latestInCwd && latestInCwd === wanted) return { resume: true }
+    return { resume: false, reason: latestInCwd ? `latest session in cwd is ${latestInCwd}, not ${wanted}` : 'no known session in this cwd' }
+  }
+  return { resume: !!resumeLatest }
+}
+
 async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { resumeLatest?: boolean } = {}): Promise<RunResult> {
+  const cwd = opts.cwd ?? spec.dir
+  return withCwdLock(cwd, () => runOnceLocked(spec, prompt, opts, cwd))
+}
+
+async function runOnceLocked(spec: AgentSpec, prompt: string, opts: RunOptions & { resumeLatest?: boolean }, cwd: string): Promise<RunResult> {
   prepareGeminiBundle(spec)
   const { getSecret } = await import('../web/vault.js')
   const secretLookup = (id: string): string | null => { try { return getSecret(id) } catch { return null } }
-  const cwd = opts.cwd ?? spec.dir
-  const args = buildGeminiArgs({ prompt, model: spec.model, approvalMode: approvalModeForProfile(undefined, opts.allowTools), resumeLatest: opts.resumeLatest ?? !!opts.resume })
+  const rd = geminiResumeDecision(opts.resume, latestSessionByCwd.get(cwd), opts.resumeLatest)
+  if (opts.resume && !rd.resume) logger.warn({ agent: spec.id, cwd, reason: rd.reason }, 'gemini-cli: cannot resume that session by id -- starting a fresh one')
+  const args = buildGeminiArgs({ prompt, model: spec.model, approvalMode: approvalModeForProfile(spec.permissionMode, opts.allowTools), resumeLatest: rd.resume })
   const env = buildGeminiEnv({ spec, secretLookup, base: { ...process.env, ...(opts.env ?? {}) } })
   const timeoutMs = opts.timeoutMs ?? DEFAULT_GEMINI_TIMEOUT_MS
   const startedAt = Date.now()
@@ -140,6 +173,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { res
     child.stderr.on('data', (d: Buffer) => { stderrTail = (stderrTail + d.toString()).slice(-2000) })
     child.on('error', (err) => { stderrTail += ` spawn error: ${err.message}`; clearTimeout(timer); resolve(null) })
     child.on('close', (code) => { clearTimeout(timer); resolve(code) })
+    child.stdin.on('error', () => { /* CLI exited before reading stdin */ })
     child.stdin.end()
   })
   const summary = acc.summary()
@@ -150,6 +184,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { res
       ? { ...result, text: null, blocked: true, reason: `timeout after ${mins}min` }
       : { ...result, text: `A feldolgozas tullepte a ${mins} perces idokorlatot. Probald rovidebben megfogalmazni, vagy bontsd tobb lepesre.`, blocked: false }
   }
+  if (result.sessionRef) latestSessionByCwd.set(cwd, result.sessionRef)
   if (result.blocked) logger.warn({ agent: spec.id, reason: result.reason, exitCode, auth: geminiShowsAuthFailure(summary, stderrTail) }, 'gemini-cli: run blocked/errored (text=null)')
   if (result.usage && !result.blocked) {
     try { const { recordRuntimeUsage } = await import('./usage-sink.js'); recordRuntimeUsage(spec.id, result.usage, { contentPreview: prompt.slice(0, 200) }) }
