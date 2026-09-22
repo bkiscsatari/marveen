@@ -2,6 +2,7 @@ import { logger } from '../logger.js'
 import { MAIN_AGENT_ID } from '../config.js'
 import { listAgentNames, readAgentRemoteHost } from './agent-config.js'
 import { isAgentRunning, captureParkedInputView, sendEnterToSession, capturePane } from './agent-process.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { resolveAgentSession } from './channel-mcp-reconnect.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { recoverStuckInputForSession, sendAlert } from './channel-monitor.js'
@@ -286,7 +287,8 @@ export function startStuckInputWatcher(): NodeJS.Timeout {
       logger.debug({ err }, 'stuck-input-watcher: main agent check error')
     }
     for (const name of listAgentNames()) {
-      if (!isAgentRunning(name)) {
+      // A headless session agent has no input box to get stuck.
+      if (!isAgentRunning(name) || isHeadlessAgent(name)) {
         watchState.delete(resolveAgentSession(name))
         continue
       }

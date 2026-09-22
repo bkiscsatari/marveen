@@ -1,6 +1,7 @@
 import { statSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { logger } from '../logger.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
 import { hardRestartMarveenChannels, lastMainRespawnAt, MARVEEN_POST_RESPAWN_GRACE_MS, markAgentRestartPending } from './channel-monitor.js'
 import { shouldDeferForRecentRespawn } from './stuck-tool-call-watcher.js'
@@ -338,6 +339,10 @@ async function performRestart(name: string): Promise<void> {
 }
 
 async function checkAgent(name: string, nowMs: number): Promise<void> {
+  // A headless session agent has no transcript to measure and no pane to
+  // rescue; its context is the runtime's own session (resume token). The
+  // guard is a pane-shaped mechanism and stays out of its way.
+  if (isHeadlessAgent(name)) return
   const cfg = readContextGuardConfig(name)
   const state = guardStates.get(name) ?? INITIAL_GUARD_STATE
 

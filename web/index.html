@@ -880,6 +880,21 @@
       </div>
 
       <!-- Env var modal for GitHub repo install -->
+      <div class="modal-overlay" id="sessionLogModal" hidden>
+        <div class="modal-content" style="max-width:820px">
+          <div class="modal-header">
+            <h3 id="sessionLogTitle">Session-napló</h3>
+            <button class="modal-close" id="sessionLogModalClose">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p class="modal-desc" id="sessionLogInfo" style="font-family:monospace;font-size:12px"></p>
+            <pre id="sessionLogBody" style="max-height:60vh;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.45;background:var(--surface-hover);padding:10px;border-radius:6px"></pre>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-secondary" id="sessionLogRefreshBtn">Frissítés</button>
+          </div>
+        </div>
+      </div>
       <div class="modal-overlay" id="envVarModal" hidden>
         <div class="modal-content">
           <div class="modal-header">
@@ -2447,7 +2462,12 @@
               </optgroup>
               <optgroup label="🏠 Ollama (lokális)" id="ollamaModelGroup">
               </optgroup>
+              <optgroup label="🪪 Előfizetéses CLI-k (headless session)" id="subscriptionModelGroup" style="display:none">
+              </optgroup>
+              <optgroup label="🧭 Jev-routed (automatikus modellválasztás)" id="routedModelGroup" style="display:none">
+              </optgroup>
             </select>
+            <small id="runtimeModelHint" style="display:none;margin-top:6px;color:var(--text-muted);font-size:12px;line-height:1.4"></small>
             <button class="btn-secondary btn-compact agent-save-section" id="saveModelBtn" data-i18n="common.btn.save">Mentés</button>
             <button class="btn-secondary btn-compact" id="modelSuggestBtn" style="margin-left:6px" data-i18n="agents.settings.model_suggest_btn">Javaslat</button>
             <button class="btn-secondary btn-compact" id="openrouterBrowseBtn" style="margin-left:6px;display:none" title="Kézi OpenRouter modellek listájának szerkesztése (pipával)">🔀 OpenRouter kézi lista</button>

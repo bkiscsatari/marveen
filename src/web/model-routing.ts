@@ -23,6 +23,8 @@ import {
   decideProfile,
   normalizeRoutingMode,
   pickTarget,
+  routingApplies,
+  shouldSwitch,
   type RoutingDecision,
   type RoutingMode,
   type RoutingSource,
@@ -31,7 +33,7 @@ import {
 import { readAgentSecurityProfile, resolveAgentModelDetailed, readModelProfileMap, resolveModelId } from './agent-config.js'
 import { MAIN_AGENT_ID } from '../config.js'
 import { jevConfigured, jevSystemOne } from './jev-client.js'
-import { resolveProfileTarget, type ProfileTarget, MODEL_PROFILE_IDS } from '../model-profiles.js'
+import { resolveProfileTarget, type ModelProfileId, type ProfileTarget, MODEL_PROFILE_IDS } from '../model-profiles.js'
 import { availableRuntimeKinds } from '../runtime/registry.js'
 import { inferProvider, runtimeSupportsProvider, defaultRuntimeFor, defaultAuthModeFor } from '../runtime/resolve-spec.js'
 import { lookupProviderSecret } from '../runtime/secret-ids.js'
@@ -136,6 +138,13 @@ export interface RouteOverride {
 export interface RouteForRunInput extends ShadowRouteInput {
   /** What the agent would run with without routing. */
   current: { runtime: RuntimeKind; provider: ProviderKind; model: string }
+  /**
+   * The profile the agent is CURRENTLY on (headless session agents). When
+   * given, shouldSwitch() hysteresis applies: any upgrade, a downgrade only
+   * two tiers down -- so a routed agent does not bounce between tiers on
+   * every task. Background runs have no current profile (fresh process).
+   */
+  currentProfile?: ModelProfileId | null
 }
 
 /**
@@ -181,7 +190,7 @@ export async function routeForRun(input: RouteForRunInput): Promise<RouteOverrid
     const mode = routingMode()
     if (mode === 'off' || !jevConfigured() || !input.text.trim()) return null
     const decision = await classifyAndLog(input)
-    if (mode !== 'background') return null
+    if (!routingApplies(mode)) return null
     if (!decision) { stampApplied(input.taskRef, input.source, { kind: 'skip', reason: 'jev_unavailable' }, null); return null }
     const mapState = readModelProfileMap()
     const targets = Object.fromEntries(MODEL_PROFILE_IDS.map((p) => [p, resolveProfileTarget(p, mapState, resolveModelId)])) as Record<string, ProfileTarget | null>
@@ -190,6 +199,12 @@ export async function routeForRun(input: RouteForRunInput): Promise<RouteOverrid
     const deps = { availableRuntimes: availableRuntimeKinds(), secretLookup, fleetOauthToken: resolveFleetOauthToken(), agentId: input.agent }
     const pick = pickTarget(decision, targets, (t) => targetAvailability(t, deps).available)
     if (pick.kind !== 'apply') { stampApplied(input.taskRef, input.source, pick, null); return null }
+    // Hysteresis for a session agent that already sits on a profile: the
+    // decision must clear shouldSwitch() before the agent is moved.
+    if (input.currentProfile && pick.profile !== input.currentProfile && !shouldSwitch(input.currentProfile, pick.profile as ModelProfileId, decision)) {
+      stampApplied(input.taskRef, input.source, { kind: 'skip', reason: `hysteresis:${input.currentProfile}->${pick.profile}` }, null)
+      return null
+    }
     const avail = targetAvailability(pick.target, deps)
     const override: RouteOverride = { profile: pick.profile, runtime: avail.runtime, provider: avail.provider, model: pick.target.model }
     stampApplied(input.taskRef, input.source, pick, override)

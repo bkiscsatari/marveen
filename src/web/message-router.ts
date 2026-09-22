@@ -29,8 +29,10 @@ import {
   sessionExistsOnHost,
   capturePane,
   clearFeedbackModalAndRecheck,
+  sessionActivityState,
 } from './agent-process.js'
-import { detectPaneState, detectsFirstRunGate, type PaneState } from '../pane-state.js'
+import { isRoutedHeadlessAgent } from './headless-agents.js'
+import { detectsFirstRunGate, type PaneState } from '../pane-state.js'
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
 import { composeBatchInjection, batchInjectCapFor } from './batch-inject.js'
@@ -670,8 +672,10 @@ export async function runMessageRouterTick(): Promise<void> {
           // Capturing here (rather than every tick) keeps the healthy path at
           // zero extra tmux calls.
           const stuckMs = now - stuckStart
-          const pane = capturePane(session, host)
-          const paneState = pane != null ? detectPaneState(pane) : null
+          // A headless session agent has no pane; its loop reports busy/idle
+          // directly, so a long turn defers the escalation the same way a
+          // busy pane does (a 15-minute mcode turn is work, not a wedge).
+          const paneState = sessionActivityState(session, host)
           if (shouldEscalateStuckSession(paneState, stuckMs)) {
             // Session has been continuously stuck past the escalation threshold.
             // Log at warn level so monitoring/revival tooling can act — the
@@ -817,7 +821,9 @@ export async function runMessageRouterTick(): Promise<void> {
         // Jev model-routing shadow (B0): classify the delegated task for the
         // calibration log. Detached, never awaited, never blocks delivery.
         // Channel inbounds (a human's Telegram text) are not delegated tasks.
-        if (!isChannelInbound) shadowRoute({ source: 'inter_agent', agent: msg.to_agent, text: content, taskRef: String(msg.id) })
+        // A Jev-routed headless agent classifies (and applies) at delivery in
+        // its own session loop; logging it here too would double-count.
+        if (!isChannelInbound && !isRoutedHeadlessAgent(msg.to_agent)) shadowRoute({ source: 'inter_agent', agent: msg.to_agent, text: content, taskRef: String(msg.id) })
         // Freshness/supersession signal: only meaningful for inter-agent
         // messages (channel-inbound are user messages with no sender-supersede
         // concept). Skip the DB count for channel-inbound to avoid needless work.

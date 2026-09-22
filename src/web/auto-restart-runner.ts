@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { logger } from '../logger.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { MAIN_AGENT_ID, SERVICE_ID } from '../config.js'
 import { listAgentNames, readAgentRemoteHost } from './agent-config.js'
 import {
@@ -119,6 +120,10 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
     lastRestart.delete(name) // re-seed cleanly if re-enabled later
     return
   }
+  // A headless session agent has no pane to read "busy" from, and its
+  // context is bounded per turn by the runtime (resume token + compaction on
+  // the CLI side), so the nightly pane refresh does not apply to it.
+  if (isHeadlessAgent(name)) return
   // Sub-agents must be up to be restarted; the main session is launchd-managed
   // (always considered present). Branch explicitly on the tri-state run state:
   // ONLY 'running' is eligible. 'unreachable' (remote laptop briefly out of

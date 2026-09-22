@@ -8,6 +8,7 @@ import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
 import { listAgentNames } from './agent-config.js'
 import { resolveAgentConfigDirForRead } from './claude-plans.js'
 import { agentSessionName, capturePane } from './agent-process.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { sendSystemDirective } from './system-directive.js'
 import { detectPaneState } from '../pane-state.js'
 import { detectsUsageLimit } from '../model-fallback.js'
@@ -704,6 +705,7 @@ export function diagnoseAgent(name: string, nowMs: number) {
 
 async function checkAgent(name: string, nowMs: number): Promise<void> {
   if (!readGateConfig(name).enabled) return   // fast-exit before any I/O
+  if (isHeadlessAgent(name)) return           // no pane, no /clear: the runtime owns the session
 
   // Settle any wake owed from an earlier /clear before measuring anything: the
   // inline nudge below can be lost to a dashboard restart, and this is what

@@ -4,6 +4,7 @@ import { logger } from '../logger.js'
 import { MAIN_AGENT_ID } from '../config.js'
 import { listAgentNames } from './agent-config.js'
 import { isAgentRunning, capturePane } from './agent-process.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import {
   resolveAgentSession,
   resolveAgentProviderType,
@@ -149,7 +150,7 @@ export function startChannelHealthMonitor(): NodeJS.Timeout {
     }
 
     for (const name of listAgentNames()) {
-      if (!isAgentRunning(name)) continue
+      if (!isAgentRunning(name) || isHeadlessAgent(name)) continue // headless: no MCP pane to grep
       try {
         checkAgent(name, resolveAgentSession(name))
       } catch (err) {

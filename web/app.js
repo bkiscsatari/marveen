@@ -3526,13 +3526,24 @@ function renderAgents() {
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           ${t('agents.btn.conversation')}
         </button>
+        ${agent.headless ? `
+        <button class="btn-secondary btn-compact agent-session-log-btn" title="A headless session-agent köreinek naplója (be/ki/váltás/hiba)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+          Napló
+        </button>` : `
         <button class="btn-secondary btn-compact agent-terminal-btn" title="Terminal">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
           Terminal
-        </button>
+        </button>`}
       </div>
       <div class="agent-card-activity"></div>
     `
+    // Session log (headless agents only): the turn log stands in for the
+    // Claude transcript the Conversation view would otherwise read.
+    card.querySelector('.agent-session-log-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      openSessionLog(agent.name, label)
+    })
     mCard.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openTerminalModal(mainAgentId())
     })
@@ -3562,7 +3573,13 @@ function renderAgents() {
       : initial
 
     const modelClass = agent.model && agent.model !== 'inherit' ? agent.model : ''
-    const modelLabel = agent.model || 'inherit'
+    const modelLabel = agent.modelRouting === 'jev' ? `🧭 Jev → ${agent.model || '?'}` : (agent.model || 'inherit')
+    // Runtime chip: only when the agent is NOT on the Claude TUI, so the
+    // default fleet looks exactly as before. State suffix for a running
+    // headless agent (busy / auth / blocked) is the loop's own report.
+    const runtimeChip = agent.headless
+      ? `<span class="agent-runtime-badge" title="Headless session-agent (nincs tmux/terminál/saját Telegram-bot); hookok: ${escapeHtml(agent.hooksMode || '?')}" style="font-size:11px;padding:1px 6px;border-radius:10px;background:var(--surface-hover);color:var(--text-muted)">${escapeHtml(agent.runtime || '?')}${agent.runtimeState && agent.runtimeState !== 'idle' ? ' · ' + escapeHtml(agent.runtimeState) : ''}</span>`
+      : ''
     const chConnected = agentIsConnected(agent)
     const chDotClass = chConnected ? 'connected' : 'disconnected'
     const chLabel = chConnected ? t('agents.status.online') : t('agents.status.offline')
@@ -3580,6 +3597,7 @@ function renderAgents() {
       </div>
       <div class="agent-card-footer">
         <span class="agent-model-badge ${escapeHtml(modelClass)}">${escapeHtml(modelLabel)}</span>
+        ${runtimeChip}
         ${contextPctBadgeHtml(agent.name)}
         <span class="process-indicator" title="${escapeHtml(processTip(isRunning))}"><span class="process-dot ${runDotClass}"></span>${runLabel}</span>
         <span class="tg-status" title="${escapeHtml(channelTip(chConnected))}"><span class="tg-dot ${chDotClass}"></span>${chLabel}</span>
@@ -3784,7 +3802,11 @@ async function openAgentDetail(agentName) {
     : initial
   document.getElementById('agentDetailName').textContent = detailLabel
   document.getElementById('agentDetailDesc').textContent = currentAgent.description || ''
-  document.getElementById('agentDetailModel').textContent = currentAgent.activeModel || currentAgent.model || 'inherit'
+  document.getElementById('agentDetailModel').textContent = currentAgent.modelRouting === 'jev'
+    ? `Jev-routed → ${currentAgent.model || '?'} (${currentAgent.runtime || '?'})`
+    : currentAgent.headless
+      ? `${currentAgent.activeModel || currentAgent.model || 'inherit'} · ${currentAgent.runtime}`
+      : (currentAgent.activeModel || currentAgent.model || 'inherit')
   document.getElementById('agentDetailModelRestarting').hidden = true
 
   const chConnected = agentIsConnected(currentAgent)
@@ -3793,22 +3815,11 @@ async function openAgentDetail(agentName) {
   // Settings tab - load Ollama + DeepSeek models then set value
   loadAvailableModels()
   loadOllamaModels().then(() => {
-    const sel = document.getElementById('editAgentModel')
-    const mv = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
-    // The model <select> is one shared element reused per agent. A manual
-    // OpenRouter id (or openrouter-auto:tier) may not be among the static/auto
-    // options, so setting .value would silently show nothing. Inject THIS
-    // agent's model as a selectable option (cleaning any stale injected ones
-    // first) so every agent always displays its own model, per-agent.
-    Array.from(sel.querySelectorAll('option.dynamic-model-opt')).forEach(o => o.remove())
-    if (!Array.from(sel.options).some(o => o.value === mv)) {
-      const opt = document.createElement('option')
-      opt.value = mv
-      opt.className = 'dynamic-model-opt'
-      opt.textContent = mv.startsWith('openrouter-auto:') ? `🔀 ${mv}` : `🔀 ${mv}`
-      sel.appendChild(opt)
-    }
-    sel.value = mv
+    // The model <select> is one shared element reused per agent; the
+    // selection rules (manual OpenRouter ids, subscription `id@runtime`
+    // entries, Jev-routed) live in selectAgentModelOption, which also runs
+    // once loadAvailableModels has filled the async groups.
+    if (currentAgent) selectAgentModelOption()
   })
   populateProfileSelect(
     document.getElementById('editAgentProfile'),
@@ -4293,6 +4304,106 @@ async function loadOllamaModels() {
   }
 }
 
+// Session log of a headless agent (the turn log the session loop appends;
+// stands in for the Claude transcript that the Conversation view reads).
+let sessionLogAgent = null
+async function openSessionLog(name, label) {
+  sessionLogAgent = name
+  const modal = document.getElementById('sessionLogModal')
+  const title = document.getElementById('sessionLogTitle')
+  if (title) title.textContent = `${label || name} – session-napló`
+  if (modal) modal.hidden = false
+  await refreshSessionLog()
+}
+async function refreshSessionLog() {
+  if (!sessionLogAgent) return
+  const body = document.getElementById('sessionLogBody')
+  const info = document.getElementById('sessionLogInfo')
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(sessionLogAgent)}/session-log?limit=80`)
+    if (!r.ok) { if (body) body.textContent = `Nem elérhető (${r.status})`; return }
+    const data = await r.json()
+    const i = data.info
+    if (info) {
+      info.textContent = i
+        ? `${i.runtime} / ${i.model} · állapot: ${i.state}${i.routed ? ` · Jev-profil: ${i.profile || '?'}` : ''} · körök: ${i.turns} · hookok: ${i.hooks}${i.lastError ? ` · utolsó hiba: ${i.lastError}` : ''}`
+        : 'Az agent most nem fut (a napló a korábbi körök).'
+    }
+    const lines = (data.entries || []).map((e) => {
+      const ts = new Date(e.ts).toLocaleString('hu-HU')
+      const tag = e.dir === 'in' ? '⬅ BE ' : e.dir === 'out' ? '➡ KI ' : e.dir === 'switch' ? '🧭 VÁLT' : '✖ HIBA'
+      return `[${ts}] ${tag} (${e.runtime}/${e.model}${e.profile ? ', ' + e.profile : ''})\n${e.text}${e.reason && e.dir === 'error' ? `\n  ok: ${e.reason}` : ''}\n`
+    })
+    if (body) body.textContent = lines.length ? lines.join('\n') : '(még nincs kör)'
+    if (body) body.scrollTop = body.scrollHeight
+  } catch (err) {
+    if (body) body.textContent = `Hiba: ${err && err.message ? err.message : err}`
+  }
+}
+document.getElementById('sessionLogModalClose')?.addEventListener('click', () => {
+  const modal = document.getElementById('sessionLogModal')
+  if (modal) modal.hidden = true
+  sessionLogAgent = null
+})
+document.getElementById('sessionLogRefreshBtn')?.addEventListener('click', () => { void refreshSessionLog() })
+
+// Which <option> of the shared model <select> describes THIS agent. A plain
+// model id is not enough any more: `minimax-m3` exists both as the direct-API
+// entry (runs in the Claude TUI) and as the subscription entry (runs on the
+// MiniMax Code CLI through the headless session loop), so the subscription
+// options carry `id@runtime` values plus dataset attributes, and a Jev-routed
+// agent selects the `jev-routed` option regardless of its live model.
+function selectAgentModelOption() {
+  const sel = document.getElementById('editAgentModel')
+  if (!sel || !currentAgent) return
+  Array.from(sel.querySelectorAll('option.dynamic-model-opt')).forEach(o => o.remove())
+  let want = null
+  if (currentAgent.modelRouting === 'jev') {
+    want = 'jev-routed'
+  } else if (currentAgent.runtime && currentAgent.runtime !== 'claude-tmux') {
+    const hit = Array.from(sel.options).find(o => o.dataset.runtime === currentAgent.runtime && o.dataset.model === currentAgent.model)
+    want = hit ? hit.value : `${currentAgent.model}@${currentAgent.runtime}`
+  } else {
+    want = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
+  }
+  if (!Array.from(sel.options).some(o => o.value === want)) {
+    // The agent's current target is not (or not yet) offered: inject it so the
+    // select never silently shows a different model than the one that runs.
+    const opt = document.createElement('option')
+    opt.value = want
+    opt.className = 'dynamic-model-opt'
+    if (want === 'jev-routed') opt.textContent = '🧭 Jev-routed'
+    else if (want.includes('@')) {
+      const [m, r] = want.split('@')
+      opt.dataset.model = m; opt.dataset.runtime = r
+      opt.textContent = `🪪 ${m} (${r})`
+    } else opt.textContent = `🔀 ${want}`
+    sel.appendChild(opt)
+  }
+  sel.value = want
+  updateRuntimeModelHint()
+}
+
+function updateRuntimeModelHint() {
+  const sel = document.getElementById('editAgentModel')
+  const hint = document.getElementById('runtimeModelHint')
+  if (!sel || !hint) return
+  const opt = sel.options[sel.selectedIndex]
+  let text = ''
+  if (opt && opt.value === 'jev-routed') {
+    const mode = (window.__routedInfo && window.__routedInfo.mode) || 'off'
+    text = mode === 'all'
+      ? 'A Jev minden feladatnál profilt választ, a store/model-profile-map.json adja hozzá a runtime+modellt. Az agent headless session-agentként fut (nincs saját Telegram-bot, nincs terminál).'
+      : `A Jev-routed mód csak MODEL_ROUTING=all mellett vált ténylegesen (most: ${mode}); addig az agent a routine_lowcost célon marad, a javaslatok a naplóba kerülnek.`
+  } else if (opt && opt.dataset && opt.dataset.runtime) {
+    text = `Headless session-agent a(z) ${opt.dataset.runtime} futtatón (${opt.dataset.runtimeAuth || 'előfizetés'}). Inter-agent üzenet, kanban és ütemezett feladat működik; saját Telegram-bot és élő terminál nincs -- a kártya „Napló” gombja mutatja a köröket.`
+  }
+  hint.textContent = text
+  hint.style.display = text ? 'block' : 'none'
+}
+
+document.getElementById('editAgentModel')?.addEventListener('change', updateRuntimeModelHint)
+
 // Populates the DeepSeek optgroups in both the wizard and the agent edit
 // panel. Backend gates the list behind a vault entry, so an empty array
 // here means the operator has not configured an API key yet -- in that
@@ -4302,6 +4413,43 @@ async function loadAvailableModels() {
     const res = await fetch('/api/models/available')
     if (!res.ok) return
     const data = await res.json()
+
+    // Subscription CLIs (headless session agents) + the Jev-routed entry.
+    // Values are `id@runtime` so the same model id can also appear in an
+    // API-key group without the two options colliding.
+    const subGroup = document.getElementById('subscriptionModelGroup')
+    const subs = Array.isArray(data.subscription) ? data.subscription : []
+    if (subGroup) {
+      subGroup.innerHTML = ''
+      subGroup.style.display = subs.length ? '' : 'none'
+      for (const m of subs) {
+        const opt = document.createElement('option')
+        opt.value = `${m.id}@${m.runtime}`
+        opt.dataset.model = m.id
+        opt.dataset.runtime = m.runtime
+        opt.dataset.provider = m.provider
+        opt.dataset.authMode = m.authMode
+        opt.dataset.runtimeAuth = m.runtimeAuth
+        opt.textContent = m.label
+        subGroup.appendChild(opt)
+      }
+    }
+    const routedGroup = document.getElementById('routedModelGroup')
+    window.__routedInfo = data.routed || null
+    if (routedGroup) {
+      routedGroup.innerHTML = ''
+      const r = data.routed
+      if (r && r.available) {
+        routedGroup.style.display = ''
+        const opt = document.createElement('option')
+        opt.value = 'jev-routed'
+        opt.textContent = r.mode === 'all' ? 'Jev-routed (feladatonként vált)' : `Jev-routed (MODEL_ROUTING=${r.mode}: még csak naplóz)`
+        routedGroup.appendChild(opt)
+      } else {
+        routedGroup.style.display = 'none'
+      }
+    }
+    if (currentAgent) selectAgentModelOption()
     const deepseekModels = Array.isArray(data.deepseek) ? data.deepseek : []
     const editGroup = document.getElementById('deepseekModelGroup')
     const wizardGroup = document.getElementById('agentModelDeepseekGroup')
@@ -4572,7 +4720,12 @@ function startModelRestartPolling(name, expectedModel, triggeredAt) {
           currentAgent.model = data.model
           currentAgent.running = !!data.running
           currentAgent.session = data.session
-          display.textContent = displayModel
+          currentAgent.runtime = data.runtime
+          currentAgent.headless = !!data.headless
+          currentAgent.modelRouting = data.modelRouting || null
+          display.textContent = data.modelRouting === 'jev'
+            ? `Jev-routed → ${data.model} (${data.runtime})`
+            : data.headless ? `${displayModel} · ${data.runtime}` : displayModel
         }
         badge.hidden = true
         processDot.className = 'process-dot running'
@@ -4589,16 +4742,43 @@ function startModelRestartPolling(name, expectedModel, triggeredAt) {
 
 document.getElementById('saveModelBtn').addEventListener('click', async () => {
   if (!currentAgent || currentAgent.role === 'main') return
-  const newModel = document.getElementById('editAgentModel').value
+  const sel = document.getElementById('editAgentModel')
+  const opt = sel.options[sel.selectedIndex]
   const name = currentAgent.name
+  // Three shapes of pick, one PUT each (the API validates every field):
+  //  - Jev-routed: modelRouting "jev", the model itself is chosen per task;
+  //  - subscription CLI entry: model + runtime + provider + authMode, so the
+  //    headless session loop drives the agent;
+  //  - everything else: a plain model, runtime/provider cleared back to the
+  //    provider default (the Claude TUI for every id the CLI can reach).
+  let payload
+  let newModel
+  if (opt && opt.value === 'jev-routed') {
+    payload = { modelRouting: 'jev' }
+    newModel = currentAgent.model
+  } else if (opt && opt.dataset && opt.dataset.runtime) {
+    newModel = opt.dataset.model
+    payload = { model: newModel, runtime: opt.dataset.runtime, provider: opt.dataset.provider || null, modelRouting: null }
+    if (opt.dataset.authMode) payload.authMode = opt.dataset.authMode
+  } else {
+    newModel = sel.value
+    payload = { model: newModel, runtime: null, provider: null, modelRouting: null }
+  }
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: newModel }),
+      body: JSON.stringify(payload),
     })
-    if (!res.ok) throw new Error()
+    if (!res.ok) {
+      let msg = ''
+      try { msg = (await res.json()).error || '' } catch { /* no body */ }
+      showToast(msg ? `${t('common.error_save')}: ${msg}` : t('common.error_save'))
+      return
+    }
     currentAgent.model = newModel
+    currentAgent.modelRouting = payload.modelRouting === 'jev' ? 'jev' : null
+    currentAgent.runtime = payload.runtime || (payload.modelRouting === 'jev' ? currentAgent.runtime : 'claude-tmux')
     const triggeredAt = Math.floor(Date.now() / 1000)
     document.getElementById('agentDetailModelRestarting').hidden = false
     document.getElementById('processLabel').textContent = t('agents.process_label')

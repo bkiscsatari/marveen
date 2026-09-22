@@ -792,3 +792,33 @@ export function writeAgentProvider(name: string, provider: string | null): void 
   else config.provider = provider
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
+
+// ---- modelRouting: "jev" = the Jev router picks the target per task ----------
+//
+// Distinct from `modelProfile` (a FIXED capability tier the operator chose):
+// a routed agent has no fixed model at all -- the headless session loop
+// (src/web/headless-agents.ts) asks the router on every delivered task and
+// switches runtime+model through store/model-profile-map.json. Only the
+// literal "jev" means routed; anything else reads as "not routed", so a typo
+// can never move an agent off its configured model.
+export type AgentModelRouting = 'jev' | null
+
+export function readAgentModelRouting(name: string): AgentModelRouting {
+  const configPath = join(agentConfigRoot(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.modelRouting === 'jev' ? 'jev' : null
+  } catch {
+    return null
+  }
+}
+
+export function writeAgentModelRouting(name: string, routing: AgentModelRouting): void {
+  if (routing !== null && routing !== 'jev') throw new Error(`Ismeretlen modelRouting: ${String(routing).slice(0, 40)}`)
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch { /* start fresh */ }
+  if (routing === null) delete config.modelRouting
+  else config.modelRouting = routing
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}

@@ -15,6 +15,12 @@
 export const AGENT_PUT_WRITABLE_FIELDS = [
   'claudeMd', 'soulMd', 'mcpJson', 'model',
   'authMode', 'apiKey', 'claudePlan', 'memoryIsolation',
+  // Card c755f4b2 Block B: fixed capability tier (handled by the route since
+  // it shipped, but never listed here -- so every PUT carrying it was a 400).
+  'modelProfile',
+  // Agent-agnostic runtime layer: which runtime/provider drives the agent,
+  // and whether the Jev router picks the target per task ("jev" | null).
+  'runtime', 'provider', 'modelRouting',
 ] as const
 
 // Fields that exist on the agent but belong to a different endpoint. Listed

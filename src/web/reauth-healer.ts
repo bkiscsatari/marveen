@@ -5,6 +5,7 @@ import { MAIN_AGENT_ID, PROJECT_ROOT, RESPAWN_ENABLED, APP_TZ } from '../config.
 import { resolveFromPath } from '../platform.js'
 import { listAgentNames } from './agent-config.js'
 import { isAgentRunning, capturePane, startAgentProcess } from './agent-process.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { isRestartInFlight } from './restart-lock.js'
 import { quarantineFleetTokenIfDead } from './claude-credentials-guard.js'
 import { resolveAgentSession } from './channel-mcp-reconnect.js'
@@ -390,7 +391,9 @@ export function startReauthHealer(): NodeJS.Timeout | null {
     }
     for (const name of listAgentNames()) {
       const session = resolveAgentSession(name)
-      if (!isAgentRunning(name)) {
+      // A headless session agent has no /login pane; its auth state is
+      // reported by its own loop and surfaced on the card.
+      if (!isAgentRunning(name) || isHeadlessAgent(name)) {
         watchState.delete(session)
         quietSuppressed.delete(session)
         continue

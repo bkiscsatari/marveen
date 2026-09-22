@@ -39,7 +39,7 @@ Kanonikus új vault-idk: `provider:<provider>:api-key`, `agent:<id>:api-key` —
 | `MARVEEN_WORKER_RUNTIME` | `claude-tmux` (default) / `claude-headless` | A `runAgent()` egylövetű generálásai (scaffold, memória-digest, heartbeat) tmux-worker helyett headless child_process-ben |
 | `MARVEEN_BG_RUNTIME` | `legacy-tmux` (default) / runtime-név | Háttérfeladatok a runtime-adapteren (nincs `bg-*` tmux-session, élő kimenet az eseményfolyamból) |
 | `CHANNEL_BRIDGE` | `plugin` (default) / `marveen` | A fő-agent Telegram-hídja: Claude channels plugin vs. Marveen saját bridge |
-| `MODEL_ROUTING` | `off` (default) / `shadow` / `background` | Jev-router: csak naplóz / a háttérfeladat runtime+modelljét is választja |
+| `MODEL_ROUTING` | `off` (default) / `shadow` / `background` / `all` | Jev-router: csak naplóz / a háttérfeladat runtime+modelljét is választja / ugyanez + a Jev-routed headless session-agentek feladatonként váltanak |
 | `MARVEEN_RUNTIME_DUMP_DIR` | könyvtár | Nyers JSONL-eseményfolyam mentése fixture-rögzítéshez |
 | `MARVEEN_EXTRA_MCP_CONFIG` | fájl | Extra `--mcp-config` a `claude-tmux` indításhoz (a bridge MCP-szervere) |
 
@@ -68,6 +68,18 @@ A `docs/runtime-parity.md` írja le a paritás-tesztet.
 ```
 
 `MODEL_ROUTING=background` esetén a Jev által javasolt profil célja fut a háttérfeladaton; a `model_routing_log` `applied_*`/`fallback_reason` oszlopai mutatják, mi történt.
+
+## Headless session-agentek (sub-agent bármely runtime-on)
+
+Egy sub-agent, akinek a feloldott runtime-ja nem `claude-tmux` (vagy Jev-routed), nem tmux-os Claude TUI-ként indul, hanem a dashboard **session-loopja** hajtja (`src/web/headless-agents.ts`): minden kézbesített üzenet egy `runtime.run(spec, szöveg, { resume })` kör, a folytatási token (`sessionRef`) a `store/headless-agents.json`-ban él túl egy dashboard-restartot, minden kör a `store/headless-agents/<agent>.jsonl` naplóba kerül (a kártyán „Napló” gomb, API: `GET /api/agents/<id>/session-log`). A tmux-primitívek (`isAgentRunning`, `sessionExistsOnHost`, `sendPromptToSession`, `isSessionReadyForPrompt`, `capturePane`) ezekre az agentekre a loophoz ágaznak el, ezért az üzenet-router, a kanban-dispatch, az ütemező és a desired-state reconciler változtatás nélkül működik velük.
+
+Beállítás a dashboardon: az agent kártyáján a modell-legördülő „Előfizetéses CLI-k” csoportja (csak a telepített ÉS bejelentkezett CLI-k tételei látszanak; forrás: `GET /api/models/available` → `subscription`), vagy kézzel az `agent-config.json`-ban: `"model": "minimax-m3", "runtime": "minimax-cli", "provider": "minimax", "authMode": "shared"`. A PUT `/api/agents/<id>` a `runtime`, `provider`, `modelRouting` mezőket is fogadja.
+
+Korlátok: nincs saját Telegram-bot (a channels plugin Claude-TUI-hoz kötött), nincs élő terminál, a pane-alapú őrök (stuck-input, reauth-healer, context-guard, auto-restart, model-fallback, channel-monitor plugin-fele) kihagyják; auth-/limit-hibát a loop jelez a kártyán (`runtimeState`) és egyszer az inbox-ba a fő-agentnek. Egy futó kör a runtime saját időkorlátjáig (mcode: `MARVEEN_AGENT_TIMEOUT_MS`, alapból 20 perc) tart; a leállítás a sort zárja, a folyó kört nem öli meg.
+
+### Jev-routed agent (`modelRouting: "jev"`, `MODEL_ROUTING=all`)
+
+A legördülő „Jev-routed” tétele (vagy `"modelRouting": "jev"` a configban): az agentnek nincs rögzített modellje. Indulás a `store/model-profile-map.json` `routine_lowcost` célján (egy `claude-tmux` cél `claude-headless`-ként fut), utána minden kézbesített feladatot a Jev besorol, a profil-térkép adja a runtime+modellt, és ha a hiszterézis (`shouldSwitch`: felfelé bármikor, lefelé csak két szint) engedi, a **következő** kör már az új célon, friss sessionnel fut (a napló `switch` sora mutatja). `MODEL_ROUTING=off|shadow|background` mellett a routed agent a kezdő célon marad és nem kérdezi a Jevet; `all` = `background` + a routed session-agentek. A fő-agent sosem routolt.
 
 ## Telegram-bridge (CHANNEL_BRIDGE=marveen)
 

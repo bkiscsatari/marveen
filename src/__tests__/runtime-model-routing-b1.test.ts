@@ -29,11 +29,11 @@ describe('profile map targets (Phase 4b)', () => {
 })
 
 describe('routing modes (B1 real now)', () => {
-  it('off | shadow | background; all -> background (respawn path not wired yet)', () => {
+  it('off | shadow | background | all (all = background + Jev-routed headless session agents)', () => {
     expect(normalizeRoutingMode(undefined)).toBe('off')
     expect(normalizeRoutingMode('shadow')).toBe('shadow')
     expect(normalizeRoutingMode('background')).toBe('background')
-    expect(normalizeRoutingMode('ALL ')).toBe('background')
+    expect(normalizeRoutingMode('ALL ')).toBe('all')
     expect(normalizeRoutingMode('junk')).toBe('off')
   })
 })

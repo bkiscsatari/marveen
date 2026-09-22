@@ -115,6 +115,14 @@ import type { AgentRunState } from '../ssh-tmux.js'
 import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
 import { detectPaneState, detectPermissionMode } from '../../pane-state.js'
 import { checkAgentPutFields, checkConfigPutFields, AGENT_PUT_WRITABLE_FIELDS } from '../agent-put-fields.js'
+// Headless session agents (runtime != claude-tmux / Jev-routed): the card,
+// the activity panel and the model picker read their state from the session
+// loop instead of a pane.
+import { isHeadlessAgent, headlessInfo, headlessActivity, readHeadlessTurnLog, invalidateHeadlessCache } from '../headless-agents.js'
+import { readAgentModelRouting, writeAgentModelRouting, writeAgentRuntime, writeAgentProvider, resolveAgentRuntimeSpec } from '../agent-config.js'
+import { isRuntimeKind, isProviderKind } from '../../runtime/types.js'
+import { subscriptionRuntimeAvailability } from '../runtime-availability.js'
+import { routingMode } from '../model-routing.js'
 import { detectReauthNeeded } from '../reauth-detect.js'
 import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
 import { readContextGuardConfig, writeContextGuardConfig, seedContextGuardForNewAgent } from '../context-guard-store.js'
@@ -441,6 +449,21 @@ interface AgentSummary {
    *  drives the dashboard "reauth needed" badge + one-click /login button. */
   needsReauth: boolean
   reauthReason?: string
+  /** Agent-agnostic runtime layer: the resolved runtime/provider this agent
+   *  is driven by (config > MARVEEN_DEFAULT_RUNTIME > provider default). */
+  runtime: string
+  provider: string
+  /** "jev" when the Jev router picks the target per task; null = fixed model. */
+  modelRouting: 'jev' | null
+  /** True when the dashboard drives this agent through the headless session
+   *  loop (no tmux pane, no channel plugin, no terminal). */
+  headless: boolean
+  /** Session-loop state for a running headless agent: idle | busy | blocked | auth. */
+  runtimeState: string | null
+  /** How governance hooks run on this runtime: native | policy-engine | none. */
+  hooksMode: string | null
+  /** Jev profile the routed agent currently sits on (headless + routed only). */
+  routedProfile: string | null
 }
 
 interface AgentDetail extends AgentSummary {
@@ -537,15 +560,38 @@ function getAgentSummary(name: string): AgentSummary {
   // resolveTranscriptLocation.
   const transcript = resolveTranscriptLocation(name)
 
+  // Runtime axis. A headless session agent reports its live target from the
+  // loop (a Jev-routed one moves between targets), a tmux agent its resolved
+  // config; neither read touches tmux.
+  const headless = !isMain && isHeadlessAgent(name)
+  const live = headless ? headlessInfo(name) : null
+  let runtime = 'claude-tmux'
+  let provider = 'anthropic'
+  try {
+    const spec = isMain ? resolveAgentRuntimeSpec(name, 'main') : resolveAgentRuntimeSpec(name, 'sub')
+    runtime = spec.runtime
+    provider = spec.provider
+  } catch { /* defaults */ }
+  if (live) { runtime = live.runtime; provider = live.provider }
+  let modelRouting: 'jev' | null = null
+  try { modelRouting = isMain ? null : readAgentModelRouting(name) } catch { /* null */ }
+
   return {
     name,
     displayName: readAgentDisplayName(name),
     description: extractDescriptionFromClaudeMd(claudeMd),
-    model: modelResolution.model,
+    model: live ? live.model : modelResolution.model,
     modelProfile: typeof agentModelConfig.modelProfile === 'string' ? agentModelConfig.modelProfile : null,
     modelSource: modelResolution.source,
     modelProfileError: modelResolution.error ?? null,
-    activeModel: running ? readActiveModelFromProjectDir(transcript.workingDir, runningSince ?? undefined, transcript.configDir) : null,
+    activeModel: live ? live.model : running ? readActiveModelFromProjectDir(transcript.workingDir, runningSince ?? undefined, transcript.configDir) : null,
+    runtime,
+    provider,
+    modelRouting,
+    headless,
+    runtimeState: live ? live.state : null,
+    hooksMode: live ? live.hooks : headless ? null : 'native',
+    routedProfile: live ? live.profile : null,
     runningSince,
     authMode: readAgentAuthMode(name),
     securityProfile: readAgentSecurityProfile(name),
@@ -693,6 +739,19 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       // Feeds the "OpenRouter - kézi" optgroup in every agent's model dropdown.
       openrouterManual: hasOpenRouter ? loadCuratedManual() : [],
       openrouterConfigured: hasOpenRouter,
+      // Agent-agnostic runtime layer: entries the operator can pick that run a
+      // sub-agent OUTSIDE the Claude TUI (headless session loop). Each entry
+      // carries the runtime/provider/authMode the PUT has to write alongside
+      // the model id; the UI never has to know the resolution rules. Only
+      // entries whose CLI is installed AND logged in are listed, so a pick
+      // cannot silently 401 on its first task.
+      subscription: subscriptionRuntimeAvailability().entries,
+      // Jev-routed: available once a usable profile map exists; MODEL_ROUTING
+      // must be `all` for it to actually move (the UI says so when it is not).
+      routed: (() => {
+        const mapState = readModelProfileMap()
+        return { available: !!mapState && mapState.ok, mapError: mapState && !mapState.ok ? mapState.error : null, mode: routingMode() }
+      })(),
     })
     return true
   }
@@ -785,6 +844,12 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     }
 
     for (const name of withoutMainAgent(listAgentNames())) {
+      // Headless session agent: state and tail come from its loop + turn log.
+      if (isHeadlessAgent(name)) {
+        const a = headlessActivity(name)
+        entries.push({ name, isMain: false, running: a.state !== 'stopped', state: a.state, mode: null, tail: a.tail })
+        continue
+      }
       // Remote agents: resolve run state + pane through the short-TTL caches so
       // this 3s-polled endpoint never blocks the event loop on an ssh timeout.
       const host = readAgentRemoteHost(name)
@@ -801,6 +866,20 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     }
 
     jsonMaybeGzip(req, res, entries)
+    return true
+  }
+
+  // The "conversation" of a headless session agent: its turn log (in / out /
+  // switch / error rows), newest last. A tmux agent has a Claude transcript
+  // instead and answers 404 here so the UI keeps using that view.
+  const sessionLogMatch = path.match(/^\/api\/agents\/([^/]+)\/session-log$/)
+  if (sessionLogMatch && method === 'GET') {
+    const name = decodeURIComponent(sessionLogMatch[1])
+    if (!isKnownAgent(name)) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (!isHeadlessAgent(name)) { json(res, { error: 'Not a headless session agent' }, 404); return true }
+    const limitRaw = Number(new URL(req.url ?? '/', 'http://localhost').searchParams.get('limit') ?? '50')
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 50
+    json(res, { name, info: headlessInfo(name), entries: readHeadlessTurnLog(name, limit) })
     return true
   }
 
@@ -853,6 +932,15 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       rows.push(deriveAgentStatus(signalsFor(MAIN_AGENT_ID, true, running, mainPane, running ? 'running' : 'stopped')))
     }
     for (const name of withoutMainAgent(listAgentNames())) {
+      if (isHeadlessAgent(name)) {
+        // No pane: the loop's own label stands in for the pane state
+        // ('working' | 'idle' | 'blocked' | 'auth' | 'stopped').
+        const a = headlessActivity(name)
+        const running = a.state !== 'stopped'
+        const sig = signalsFor(name, false, running, null, running ? 'running' : 'stopped')
+        rows.push(deriveAgentStatus({ ...sig, paneState: (a.state === 'blocked' || a.state === 'auth' ? 'error' : a.state) as AgentStatusSignals['paneState'] }))
+        continue
+      }
       const host = readAgentRemoteHost(name)
       const runState = agentRunStateCached(name, host != null)
       const running = runState === 'running'
@@ -2243,6 +2331,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       claudeMd?: string; soulMd?: string; mcpJson?: string; model?: string
       authMode?: AuthMode; apiKey?: string; claudePlan?: string; memoryIsolation?: boolean
       modelProfile?: string | null
+      runtime?: string | null; provider?: string | null; modelRouting?: 'jev' | null | ''
     }
 
     // Unknown fields are rejected rather than silently dropped -- see
@@ -2274,6 +2363,34 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     if (data.soulMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), data.soulMd)
     if (data.mcpJson !== undefined) atomicWriteFileSync(join(agentDir(name), '.mcp.json'), data.mcpJson)
     if (data.model !== undefined) writeAgentModel(name, data.model)
+    // Agent-agnostic runtime axis. null / '' clears the key (back to the
+    // provider default); an unknown kind is a 400, never persisted -- a stored
+    // typo would show one runtime on the card while launch ran another.
+    if (data.runtime !== undefined) {
+      const v = data.runtime === null || data.runtime === '' ? null : String(data.runtime)
+      if (v !== null && !isRuntimeKind(v)) { json(res, { error: `Ismeretlen runtime: ${v.slice(0, 40)}` }, 400); return true }
+      writeAgentRuntime(name, v)
+      invalidateHeadlessCache(name)
+    }
+    if (data.provider !== undefined) {
+      const v = data.provider === null || data.provider === '' ? null : String(data.provider)
+      if (v !== null && !isProviderKind(v)) { json(res, { error: `Ismeretlen provider: ${v.slice(0, 40)}` }, 400); return true }
+      writeAgentProvider(name, v)
+      invalidateHeadlessCache(name)
+    }
+    if (data.modelRouting !== undefined) {
+      const v = data.modelRouting === null || data.modelRouting === '' ? null : data.modelRouting
+      if (v !== null && v !== 'jev') { json(res, { error: 'modelRouting must be "jev" or null' }, 400); return true }
+      if (v === 'jev') {
+        // A routed agent needs the profile map to have somewhere to route to;
+        // refusing here is the same rule modelProfile applies below.
+        const mapState = readModelProfileMap()
+        if (!mapState) { json(res, { error: 'No model-profile map is provisioned on this deployment; a Jev-routed agent cannot be started yet (store/model-profile-map.json).' }, 400); return true }
+        if (!mapState.ok) { json(res, { error: `Model-profile map is unusable: ${mapState.error}` }, 400); return true }
+      }
+      writeAgentModelRouting(name, v)
+      invalidateHeadlessCache(name)
+    }
     // Card c755f4b2 Block B: optional generic capability tier. An unknown id
     // is a 400, never a persisted value -- storing one would leave the UI
     // showing a profile while resolution silently fell back to the install

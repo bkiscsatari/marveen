@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { logger } from '../logger.js'
+import { headlessAgentForSession, headlessPaneState, headlessInfo } from './headless-agents.js'
 import { decideDesktopGate, readDesktopLock, recordDesktopSkip } from './desktop-lock.js'
 import {
   PROJECT_ROOT,
@@ -1195,7 +1196,11 @@ async function attemptFireTask(
         endDelivery()
       }
     }
-    setTimeout(() => { void resubmit(0) }, 2000)
+    // A headless session agent takes the prompt as one queued turn: there is
+    // no input box for an Enter to be swallowed in, so the resubmit chain has
+    // nothing to measure. Delivery is complete the moment send() queued it.
+    if (headlessAgentForSession(session)) endDelivery()
+    else setTimeout(() => { void resubmit(0) }, 2000)
     return 'fired'
   } catch (err) {
     logger.warn({ err, task: task.name }, 'Failed to fire scheduled task')
@@ -1693,8 +1698,13 @@ export function startScheduleRunner(): NodeJS.Timeout {
     // send a one-shot alert. Clear entries when the session goes idle (task done)
     // or the maximum tracking age is reached.
     for (const [key, entry] of taskInflightMap) {
-      const pane = capturePane(entry.session, entry.host)
-      const state = pane != null ? detectPaneState(pane) : null
+      // A headless session agent has no pane and no Claude transcript: its
+      // loop is the evidence. 'busy' while the turn runs, and a lastTurnAt
+      // newer than the injection covers the fast task that finished between
+      // two sweeps -- the same two facts the pane + transcript pair provides.
+      const headlessName = headlessAgentForSession(entry.session)
+      const pane = headlessName ? null : capturePane(entry.session, entry.host)
+      const state = headlessName ? headlessPaneState(headlessName) : pane != null ? detectPaneState(pane) : null
       // Record evidence that the injection actually started a turn. 'busy' is
       // the direct observation; the transcript mtime covers the task that ran
       // and finished entirely between two sweeps, which no pane sample would
@@ -1706,6 +1716,9 @@ export function startScheduleRunner(): NodeJS.Timeout {
       if (!entry.sawTurn) {
         if (state === 'busy') {
           entry.sawTurn = true
+        } else if (headlessName) {
+          const lastTurnAt = headlessInfo(headlessName)?.lastTurnAt ?? null
+          if (lastTurnAt != null && lastTurnAt > entry.injectedAt) entry.sawTurn = true
         } else {
           lastMtimeSeen = readTranscriptMtimeAcrossConfigDirs(entry.workingDir, entry.configDirs)
           if (lastMtimeSeen != null && lastMtimeSeen > entry.injectedAt) entry.sawTurn = true

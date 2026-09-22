@@ -25,18 +25,25 @@
 
 import { MODEL_PROFILE_IDS, isModelProfileId, type ModelProfileId } from './model-profiles.js'
 
-export const ROUTING_MODES = ['off', 'shadow', 'background'] as const
+export const ROUTING_MODES = ['off', 'shadow', 'background', 'all'] as const
 export type RoutingMode = (typeof ROUTING_MODES)[number]
 
 /** Unknown or empty -> 'off'. 'background' = B1: apply the suggestion to
- *  background tasks (fresh runtime process, no respawn). 'all' is reserved for
- *  the inter-agent/kanban respawn path and behaves as 'background' until that
- *  is wired, so a config written ahead of it cannot switch a live pane. */
+ *  background tasks (fresh runtime process, no respawn). 'all' = B1 plus the
+ *  Jev-routed headless session agents (src/web/headless-agents.ts): a routed
+ *  sub-agent switches runtime+model between tasks. A live tmux pane is never
+ *  moved by any mode -- a routed agent is headless by construction. */
 export function normalizeRoutingMode(raw: unknown): RoutingMode {
   const v = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
   if (v === 'shadow') return 'shadow'
-  if (v === 'background' || v === 'all') return 'background'
+  if (v === 'background') return 'background'
+  if (v === 'all') return 'all'
   return 'off'
+}
+
+/** Modes in which a suggestion is APPLIED (not only logged). */
+export function routingApplies(mode: RoutingMode): boolean {
+  return mode === 'background' || mode === 'all'
 }
 
 export type RoutingSource = 'inter_agent' | 'kanban' | 'background'

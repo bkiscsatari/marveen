@@ -13,6 +13,7 @@ import {
   decideProfile,
   normalizeRoutingMode,
   parseRoutingAnswers,
+  routingApplies,
   scrubSecrets,
   shouldSwitch,
   strongerOf,
@@ -20,14 +21,21 @@ import {
 import { MODEL_PROFILE_IDS } from '../model-profiles.js'
 
 describe('normalizeRoutingMode', () => {
-  it('is off unless explicitly set; background/all are the B1 apply mode', () => {
+  it('is off unless explicitly set; background and all are the two apply modes', () => {
     expect(normalizeRoutingMode(undefined)).toBe('off')
     expect(normalizeRoutingMode('')).toBe('off')
     expect(normalizeRoutingMode('nonsense')).toBe('off')
     expect(normalizeRoutingMode('shadow')).toBe('shadow')
     expect(normalizeRoutingMode(' Shadow ')).toBe('shadow')
     expect(normalizeRoutingMode('background')).toBe('background')
-    expect(normalizeRoutingMode('all')).toBe('background')
+    // 'all' = background + the Jev-routed headless session agents. It used
+    // to fold into 'background' while the respawn path was unwired; a routed
+    // agent is headless by construction now, so no live pane can be moved.
+    expect(normalizeRoutingMode('all')).toBe('all')
+    expect(routingApplies('all')).toBe(true)
+    expect(routingApplies('background')).toBe(true)
+    expect(routingApplies('shadow')).toBe(false)
+    expect(routingApplies('off')).toBe(false)
   })
 })
 

@@ -4,6 +4,20 @@ import { homedir } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { makeLazyBinResolver } from '../platform.js'
 import { logger } from '../logger.js'
+// Headless session agents (runtime != claude-tmux, or Jev-routed): every tmux
+// primitive below branches to the session loop for them, so callers that only
+// know a session name keep working unchanged.
+import {
+  isHeadlessAgent,
+  headlessAgentForSession,
+  headlessRunning,
+  headlessRunningSince,
+  headlessState,
+  headlessPaneState,
+  startHeadlessAgent,
+  stopHeadlessAgent,
+  sendToHeadlessAgent,
+} from './headless-agents.js'
 import {
   paneLooksIdle,
   decideSubmitFollowup,
@@ -27,6 +41,7 @@ import {
   stuckInputSignature,
   mcpTrustAcceptKeys,
   type FirstRunGateKind,
+  type PaneState,
 } from '../pane-state.js'
 import { scheduleRecoveryBrief } from './restart-recovery-brief.js'
 import { beginRestart, endRestart } from './restart-lock.js'
@@ -1226,6 +1241,7 @@ function captureTmux(target: string | null | TmuxTarget, tmuxArgs: string[], opt
 // an SSH drop must never read as 'stopped', which would trigger a wrong
 // auto-restart or a duplicate start). See classifyRunState.
 export function agentRunState(name: string): AgentRunState {
+  if (isHeadlessAgent(name)) return headlessRunning(name) ? 'running' : 'stopped'
   const target = agentTmuxTarget(name)
   const host = target.host
   try {
@@ -1252,6 +1268,8 @@ export function isAgentRunning(name: string): boolean {
 // laptop over ssh; an ssh failure returns false (the loop retries next tick),
 // matching the local "session not found" semantics.
 export function sessionExistsOnHost(host: string | null, session: string): boolean {
+  const headless = headlessAgentForSession(session)
+  if (headless) return headlessRunning(headless)
   try {
     // `list-sessions` carries no -t/-s, so the args-based fallback cannot see
     // whose session this is -- and a per-user agent's session lives on ITS OWN
@@ -1269,6 +1287,7 @@ export function sessionExistsOnHost(host: string | null, session: string): boole
 }
 
 export function getAgentRunningSince(name: string, session: string = agentSessionName(name)): number | null {
+  if (isHeadlessAgent(name)) return headlessRunningSince(name)
   try {
     const target = agentTmuxTarget(name)
     const host = target.host
@@ -1376,6 +1395,26 @@ export function shouldBriefAfterStart(
   return opts.fresh === true && result.ok
 }
 
+// The part of an agent launch that is about the AGENT, not about the Claude
+// TUI: the security profile's allow/deny list and every managed CLAUDE.md
+// section. Shared by the tmux path and the headless session path so a
+// sub-agent on mcode/codex/gemini starts with the same governance surface --
+// the runtime adapters render these files into their own formats
+// (AGENTS.md, .codex/hooks.json, the mcode plugin) from exactly this state.
+function applyRuntimeNeutralScaffold(name: string): ReturnType<typeof loadProfileTemplate> {
+  const profile = loadProfileTemplate(resolveAgentSecurityProfile(name))
+  writeAgentSettingsFromProfile(name, profile)
+  ensureFleetRosterSection(name)
+  ensureAutonomySection(name)
+  ensureSkillsPathTrapSection(name)
+  ensureSystemDirectiveAuthSection(name)
+  ensureMemorySearchLabelSection(name)
+  ensureFleetAuthSection(name)
+  ensureEvidenceSection(name)
+  ensureMcpListChannelSection(name)
+  return profile
+}
+
 export async function startAgentProcess(name: string, opts: { fresh?: boolean } = {}): Promise<{ ok: boolean; pid?: number; error?: string }> {
   const dir = agentDir(name)
   if (!existsSync(dir)) return { ok: false, error: 'Agent not found' }
@@ -1392,6 +1431,25 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
   // memoryIsolation flag this is a no-op and the shared-memory behavior of
   // existing installs is byte-identical.
   if (readAgentMemoryIsolation(name)) provisionMemoryBoundaryDir(dir)
+
+  // Headless session agent: no tmux, no Claude TUI, no channel plugin. The
+  // agent's governance files are refreshed exactly as for a pane, then the
+  // session loop takes over (src/web/headless-agents.ts).
+  if (isHeadlessAgent(name)) {
+    if (headlessRunning(name)) return { ok: false, error: 'Agent is already running' }
+    try {
+      applyRuntimeNeutralScaffold(name)
+    } catch (err) {
+      logger.warn({ err, name }, 'headless start: scaffold refresh failed (continuing with the files on disk)')
+    }
+    const r = await startHeadlessAgent(name, opts)
+    if (!r.ok) {
+      logger.error({ name, error: r.error }, 'Headless agent start failed')
+      return { ok: false, error: r.error }
+    }
+    logger.info({ name }, 'Headless session agent started')
+    return { ok: true }
+  }
 
   // Linux shared-credentials race guard (opt-in, default OFF; no-op on macOS
   // and without the flag). Runs before launch so a valid setup-token retires
@@ -1506,16 +1564,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // `leader` (tech-lead) -> 'applier' (Supabase retained), everyone else ->
     // 'default' (deny-by-default). Keeps a fresh install's tech-lead an applier
     // without hardcoding agent names.
-    const profile = loadProfileTemplate(resolveAgentSecurityProfile(name))
-    writeAgentSettingsFromProfile(name, profile)
-    ensureFleetRosterSection(name)
-    ensureAutonomySection(name)
-    ensureSkillsPathTrapSection(name)
-    ensureSystemDirectiveAuthSection(name)
-    ensureMemorySearchLabelSection(name)
-    ensureFleetAuthSection(name)
-    ensureEvidenceSection(name)
-    ensureMcpListChannelSection(name)
+    const profile = applyRuntimeNeutralScaffold(name)
     // A sub-agent must load ONLY its own channel plugin. The user-scope
     // enabledPlugins would otherwise make EVERY sub-agent spawn a telegram
     // (and slack/discord) poller that falls back to the main agent's bot
@@ -1951,6 +2000,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
 }
 
 export async function stopAgentProcess(name: string): Promise<{ ok: boolean; error?: string }> {
+  if (isHeadlessAgent(name)) return stopHeadlessAgent(name)
   const session = agentSessionName(name)
   if (!isAgentRunning(name)) return { ok: false, error: 'Agent is not running' }
 
@@ -2548,6 +2598,9 @@ export async function sendPromptToSession(
   host: string | null = null,
   opts: { waitForIdle?: boolean; onBusyTimeout?: 'send' | 'abort'; idleTimeoutMs?: number; lockMode?: SendLockMode } = {},
 ): Promise<'sent' | 'aborted-busy' | 'skipped-locked'> {
+  // Headless session agent: no keystrokes, no lane lock -- one queued turn.
+  const headless = headlessAgentForSession(session)
+  if (headless) return sendToHeadlessAgent(headless, text, { onBusyTimeout: opts.onBusyTimeout })
   const lockMode: SendLockMode = opts.lockMode ?? 'deliver'
   // PANEWRITERS805: the three modal dismissals are probe+act keystroke writers
   // that ran BEFORE the lane lock -- so they could press Escape/Enter into a
@@ -2810,7 +2863,23 @@ export async function waitForPaneSettle(
   return false
 }
 
+/**
+ * Coarse activity of a session for callers that would otherwise classify a
+ * pane: a tmux pane goes through detectPaneState, a headless session agent
+ * answers from its loop ('busy' while a turn runs, else 'idle'). null = no
+ * such session / unreadable pane.
+ */
+export function sessionActivityState(session: string, host: string | null = null): PaneState | null {
+  const headless = headlessAgentForSession(session)
+  if (headless) return headlessPaneState(headless)
+  const pane = capturePane(session, host)
+  return pane != null ? detectPaneState(pane) : null
+}
+
 export function capturePane(session: string, host: string | null = null): string | null {
+  // A headless session agent has no pane. Answer null without a tmux call so
+  // the many pane readers (activity panel, watchers) take their null path.
+  if (headlessAgentForSession(session)) return null
   try {
     // Capture WITH colour, strip a trailing /rename session-title banner, then
     // remove all remaining ANSI. For a pane without a banner this is byte-for-byte
@@ -2931,6 +3000,11 @@ export function saturationRefusesDispatch(capture: string, session: string): boo
 }
 
 export async function isSessionReadyForPrompt(session: string, host: string | null = null): Promise<boolean> {
+  // Headless session agent: ready = no turn in flight. Auth/limit failures
+  // are NOT "not ready" -- the next task must be allowed to try again (and
+  // to fail loudly into the log) instead of stranding as pending forever.
+  const headless = headlessAgentForSession(session)
+  if (headless) return headlessState(headless) !== 'busy' && headlessRunning(headless)
   // Dim-ghost tolerant idle read: CC >=2.1.202 paints a dim placeholder into
   // the empty input box, which a plain capture reads as parked text. Only when
   // the plain view says 'typing' do we pay for the second (-e, dim-stripped)

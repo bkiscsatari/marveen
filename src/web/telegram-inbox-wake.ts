@@ -1,6 +1,7 @@
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { logger } from '../logger.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { MAIN_AGENT_ID, SUBAGENT_TELEGRAM_WAKE_ENABLED } from '../config.js'
 import { resolveAgentChannelStateDir } from './voice-directive.js'
 import { listAgentNames, readAgentRemoteHost } from './agent-config.js'
@@ -155,8 +156,9 @@ export async function maybeWakeSubAgentsForTelegram(now: number): Promise<void> 
   }
   for (const name of names) {
     // The main agent runs with --channels and receives notifications natively;
-    // it has no local derived inbox to drain.
-    if (name === MAIN_AGENT_ID) continue
+    // it has no local derived inbox to drain. A headless session agent has no
+    // channel plugin, hence no tee-derived inbox either.
+    if (name === MAIN_AGENT_ID || isHeadlessAgent(name)) continue
     try {
       const stateDir = resolveAgentChannelStateDir(name, 'telegram')
       const inboxPath = join(stateDir, 'inbox-pending.jsonl')

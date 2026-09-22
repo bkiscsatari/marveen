@@ -6,6 +6,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { makeLazyBinResolver } from '../platform.js'
 import { WEB_PORT } from '../config.js'
 import { logger } from '../logger.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from '../config-registry.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
@@ -1870,7 +1871,9 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     type Target = { session: string; isMarveen: boolean; agentName?: string; provider: ChannelProviderType }
     const targets: Target[] = [{ session: MAIN_CHANNELS_SESSION, isMarveen: true, provider: mainProvider }]
     for (const a of listAgentNames()) {
-      if (isAgentRunning(a) && agentHasChannel(a)) {
+      // A headless session agent runs no channel plugin (its Telegram token
+      // file may still exist from a tmux past) -- nothing to watch.
+      if (isAgentRunning(a) && agentHasChannel(a) && !isHeadlessAgent(a)) {
         targets.push({
           session: agentSessionName(a),
           isMarveen: false,

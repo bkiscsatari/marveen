@@ -33,6 +33,7 @@ import { logger } from '../logger.js'
 import { MAIN_AGENT_ID } from '../config.js'
 import { agentDir, listAgentNames } from './agent-config.js'
 import { isAgentRunning } from './agent-process.js'
+import { isHeadlessAgent } from './headless-agents.js'
 import { readLastIngestionTimestamp, readLastIngestionTimestampAcross, mainTranscriptDirs } from './inbound-probe.js'
 import { sendRoutineAlert } from './routine-alert.js'
 
@@ -314,8 +315,9 @@ export function startChannelIntakeMonitor(projectRoot: string): NodeJS.Timeout {
   async function check(): Promise<void> {
     const names = [MAIN_AGENT_ID, ...listAgentNames().filter(n => n !== MAIN_AGENT_ID)]
     for (const name of names) {
-      // A stopped agent has no poller by design; that is not deafness.
-      if (name !== MAIN_AGENT_ID && !isAgentRunning(name)) {
+      // A stopped agent has no poller by design; that is not deafness. Neither
+      // has a headless session agent (no channel plugin at all).
+      if (name !== MAIN_AGENT_ID && (!isAgentRunning(name) || isHeadlessAgent(name))) {
         lastObservation.delete(name)
         continue
       }

@@ -65,6 +65,13 @@ describe('checkAgentPutFields', () => {
     expect([...AGENT_PUT_WRITABLE_FIELDS]).toEqual([
       'claudeMd', 'soulMd', 'mcpJson', 'model',
       'authMode', 'apiKey', 'claudePlan', 'memoryIsolation',
+      // modelProfile was handled by the route since card c755f4b2 but never
+      // listed here, so every PUT carrying it was a 400 -- now reviewed in.
+      'modelProfile',
+      // Agent-agnostic runtime layer (2026-09-22): runtime / provider select
+      // the runtime an agent is driven by; modelRouting "jev" hands the
+      // choice to the Jev router per task. All three validated by the route.
+      'runtime', 'provider', 'modelRouting',
     ])
     expect(AGENT_PUT_WRITABLE_FIELDS).not.toContain('securityProfile')
   })
