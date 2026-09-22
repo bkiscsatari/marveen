@@ -13,7 +13,7 @@
 
 > AI csapatod, ami fut amíg te alszol.
 
-Marveen egy AI asszisztens keretrendszer, ami Claude Code-ra épül. Saját AI csapatot építhetsz, akik Telegramon vagy Slacken kommunikálnak veled, önállóan dolgoznak, és egymással is együttműködnek.
+Marveen egy AI asszisztens keretrendszer, ami Claude Code-ra épül. Az agent-agnosztikus runtime réteggel (lásd `docs/runtime.md`) az ügynökök Codex CLI-n, Gemini CLI-n vagy bármely API-kulcsos modellen (DeepSeek, MiniMax, OpenRouter, Ollama, …) is futnak, a Claude Code marad az első osztályú alapértelmezés. Saját AI csapatot építhetsz, akik Telegramon vagy Slacken kommunikálnak veled, önállóan dolgoznak, és egymással is együttműködnek.
 
 ## Funkciók
 

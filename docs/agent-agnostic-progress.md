@@ -113,3 +113,28 @@ Kereszt-vágás: `AgentSpec.extraMcpServers` — minden adapter beolvasztja (cla
 - `src/web/model-routing.ts`: `routeForRun` — a B0 shadow-sort változatlanul beírja, `background` módban a kiválasztott célt alkalmazza és a sorra rástampolja: `applied`, `applied_runtime`, `applied_model`, `fallback_reason` (db.ts ALTER). `targetAvailability`: runtime szállítva-e, provider/runtime pár érvényes-e, kulcs/login (vault; Anthropic+claude-runtime → fleet OAuth; ollama → semmi; codex/gemini → az adapter healthProbe-jára bízva). A kvóta-ablakok (7. szakasz) bekötése a `targetAvailability`-ba a következő lépés.
 - `src/web/routes/background-tasks.ts`: runtime-módban (`MARVEEN_BG_RUNTIME`) a spec `runtime/provider/model` hármasát a Jev-cél írja felül; a legacy tmux-út a shadow-logot írja tovább.
 - Kill-switch: `MODEL_ROUTING=off`. Mérés: a `shadow_marveen_routing.py` riport a `runtime`/`applied_*` oszlopokkal bővítendő (a Jev-repóban, `~/Projects/Jev/scripts/`).
+
+## Phase 6 — dokumentáció, konfig, paritás-teszt
+
+- `docs/runtime.md` (operátori leírás: tengelyek, auth runtime-onként, flagek, governance, profil-map, bridge), `docs/runtime-parity.md` (paritás-mátrix + automatikus teszt), `.env.example` (új flagek), `config-examples/model-profile-map.example.json` (objektum-forma), README-mutató.
+- `src/__tests__/runtime-governance-parity.test.ts`: a VALÓDI `egress-gate.mjs` ugyanazt dönti a PolicyEngine-en, a Codex-shimen és a Gemini-shimen át (tiltott host → deny; allowlistált dashboard-URL → allow).
+- `scripts/record-runtime-fixture.sh claude|codex|gemini`: fixture-újrarögzítés `MARVEEN_RUNTIME_DUMP_DIR`-rel, titok-szűréssel.
+
+**Nem került be (szándékosan, owner-döntés kell):** a plugin-út (`channels.sh`, `channel-poller-reap`, `channel-plugin-unlock`, `channel-mcp-reconnect`) törlése/legacy-be mozgatása — a bridge élő tesztje előtt ez korai; a `MODEL_ROUTING=all` (inter-agent/kanban respawn) bekötése — a doksi szerint ≥100 címkézett shadow-sor után; kvóta-ablakok bekötése a `targetAvailability`-ba (a claude-headless `rate_limit_event`-je már elérhető a streamből, a codex `collect_codex()` a `usage-collect.py`-ban).
+
+---
+
+## ÖSSZEFOGLALÓ (2026-09-22)
+
+Branch: `feat/agent-agnostic` a `/home/balint/marveen-agnostic` klónban. Az éles `~/marveen` érintetlen, semmi nem lett merge-elve.
+
+Kész fázisok: 0 (interfész + registry + claude-tmux), 1 (claude-headless + worker/háttérfeladat flagek, **élőben ellenőrizve**), 2 (codex-cli + bundle-render + natív hook-shim; hibaút élőben), 3 (gemini-cli + settings-render + shim; hibaút élőben), 4 (native-api AI SDK tool-loop + PolicyEngine + permissions, **élőben ellenőrizve lokális Ollamán**), 4b (Jev B1 háttérfeladatokra), 5 (saját Telegram-bridge + reply MCP-szerver + fő-agent bármely runtime-on; MCP-szerver valós folyamatként tesztelve), 6 (doksi, konfig, paritás-teszt).
+
+Teszt-állapot: `npm run typecheck` tiszta; `npm test` ≈4660 zöld, 1 előre meglévő piros (`hook-registration-completeness`: az éles `agent-forgalom-kapu.py` nincs regisztrálva — éles-oldali teendő), a `memory-performance` Ollama-időzítéstől függően villog.
+
+### Owner-teendők (ezek nélkül nem megy tovább)
+1. **Codex CLI login** a WSL-ben: `codex login --device-auth` (ChatGPT-előfizetés) VAGY `OPENAI_API_KEY` a vaultba; utána `npx tsx scripts/smoke-codex-cli.ts`, majd `scripts/record-runtime-fixture.sh codex`, és a `resume` argumentum-sorrend ellenőrzése.
+2. **Gemini CLI login**: `NO_BROWSER=true gemini` (auth-kód) VAGY `GEMINI_API_KEY` a vaultba; `npx tsx scripts/smoke-gemini-cli.ts`; fixture-rögzítés.
+3. **Dev Telegram-bot** a @BotFather-nél; a dev `.env`-be `TELEGRAM_BOT_TOKEN` + `ALLOWED_CHAT_ID`; `CHANNEL_BRIDGE=marveen WEB_PORT=3421 npm run dev` → egy üzenet → válasz a headless fő-agenttől; utána `codex-cli`/`gemini-cli` fő-agent ugyanígy.
+4. **Vault-kulcsok** a natív loophoz (DeepSeek/MiniMax/OpenRouter…): a vaultban ma csak ELEVENLABS_API_KEY és FAL_KEY van.
+5. **Merge-döntés**: a flagek alapértelmezése a régi viselkedés (`claude-tmux`, `legacy-tmux`, `CHANNEL_BRIDGE=plugin`, `MODEL_ROUTING=off`), így a merge önmagában nem változtat az élesen; az átkapcsolás flagenként történhet.

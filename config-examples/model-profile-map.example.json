@@ -7,7 +7,8 @@
     "Phase 1 intent is ABSTRACTION, not re-tiering: build the first map from the models the",
     "fleet ALREADY runs, so switching an agent to a profile changes nothing observable.",
     "Two profiles MAY point at the same concrete model - that is expected in a first map.",
-    "Precedence: an agent's explicit `model` always wins over its `modelProfile`."
+    "Precedence: an agent's explicit `model` always wins over its `modelProfile`.",
+    "Agent-agnostic: a value may also be an object { \"model\", \"runtime\"?, \"provider\"? } naming which runtime executes the tier (see docs/runtime.md)."
   ],
   "version": "example-1",
   "profiles": {
@@ -15,5 +16,17 @@
     "build_strong": "claude-sonnet-5",
     "analysis_efficient": "deepseek-v4-pro",
     "routine_lowcost": "deepseek-v4-pro"
+  },
+  "_example_object_form": {
+    "build_strong": {
+      "model": "gpt-5.6-sol",
+      "runtime": "codex-cli",
+      "provider": "openai"
+    },
+    "routine_lowcost": {
+      "model": "qwen2.5:1.5b",
+      "runtime": "native-api",
+      "provider": "ollama"
+    }
   }
 }

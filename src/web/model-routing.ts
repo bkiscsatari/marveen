@@ -181,7 +181,7 @@ export async function routeForRun(input: RouteForRunInput): Promise<RouteOverrid
     const mode = routingMode()
     if (mode === 'off' || !jevConfigured() || !input.text.trim()) return null
     const decision = await classifyAndLog(input)
-    if (mode !== 'background' && mode !== 'all') return null
+    if (mode !== 'background') return null
     if (!decision) { stampApplied(input.taskRef, input.source, { kind: 'skip', reason: 'jev_unavailable' }, null); return null }
     const mapState = readModelProfileMap()
     const targets = Object.fromEntries(MODEL_PROFILE_IDS.map((p) => [p, resolveProfileTarget(p, mapState, resolveModelId)])) as Record<string, ProfileTarget | null>
