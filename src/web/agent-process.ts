@@ -1437,6 +1437,22 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
   // session loop takes over (src/web/headless-agents.ts).
   if (isHeadlessAgent(name)) {
     if (headlessRunning(name)) return { ok: false, error: 'Agent is already running' }
+    // The agent may have been a tmux agent until a moment ago (the operator
+    // just picked a subscription CLI on its card): isAgentRunning answers for
+    // the loop now, so nothing else would ever notice the old Claude TUI --
+    // and its channel plugin -- still running. Measured live 2026-09-22: the
+    // switched Scout had both a headless loop and its old pane. Same pre-kill
+    // + orphan reap the tmux path does.
+    try {
+      const staleSession = agentSessionName(name)
+      const target = agentTmuxTarget(name)
+      if (sessionInList(captureTmux(target, ['list-sessions', '-F', '#{session_name}']), staleSession)) {
+        logger.warn({ name, session: staleSession }, 'headless start: killing the agent\'s stale tmux session (runtime switched away from claude-tmux)')
+        runTmux(target, ['kill-session', '-t', staleSession], { timeout: 5000 })
+        await delay(2000)
+        try { reapChannelOrphans(resolveAgentProvider(name), dir, { tmuxPath: tmuxBin() }) } catch (err) { logger.warn({ err, name }, 'headless start: channel-poller reap failed (continuing)') }
+      }
+    } catch { /* no tmux server / no such session -- nothing to clean */ }
     try {
       applyRuntimeNeutralScaffold(name)
     } catch (err) {
@@ -1449,6 +1465,13 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     }
     logger.info({ name }, 'Headless session agent started')
     return { ok: true }
+  }
+  // The mirror case: the agent was headless until the operator picked a
+  // Claude model again. isHeadlessAgent is false now, so the loop's entry
+  // would linger idle forever; drop it before the pane takes over.
+  if (headlessRunning(name)) {
+    logger.info({ name }, 'tmux start: dropping the agent\'s stale headless session (runtime switched to claude-tmux)')
+    await stopHeadlessAgent(name)
   }
 
   // Linux shared-credentials race guard (opt-in, default OFF; no-op on macOS
