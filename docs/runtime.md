@@ -24,7 +24,7 @@ Példa `agent-config.json`:
 | runtime | subscription | api |
 |---|---|---|
 | claude-tmux / claude-headless | fleet OAuth token (`CLAUDE_CODE_OAUTH_TOKEN` a `.env`-ben, vagy `store/.claude-oauth-token`) | `ANTHROPIC_API_KEY` vault-id, per-agent: `agent-<id>-api-key` |
-| codex-cli | `codex login --device-auth` → `~/.codex/auth.json` (az adapter belinkeli minden agent `.codex/`-ába) | `OPENAI_API_KEY` vault-id → `CODEX_API_KEY` env a futásnak |
+| codex-cli | `codex login --device-auth` → `~/.codex/auth.json` (az adapter belinkeli minden agent `.codex/`-ába — több párhuzamos Codex-agentnél a forgó refresh-token ütközhet, flottára az API-kulcs mód ajánlott) | `OPENAI_API_KEY` vault-id → `CODEX_API_KEY` env a futásnak |
 | gemini-cli | `NO_BROWSER=true gemini` → `~/.gemini/oauth_creds.json` | `GEMINI_API_KEY` vault-id |
 | minimax-cli | `mcode login --region global --no-browser` (eszköz-kódos flow) → `~/.minimax` | `MINIMAX_API_KEY` vault-id (vagy `mcode provider set-minimax-key`) |
 | native-api | — | providerenként: `DEEPSEEK_API_KEY`, `MINIMAX_API_KEY`, `openrouter-fleet-key`, `MOONSHOT_API_KEY`, `ZHIPU_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`; Ollama-hoz semmi |
@@ -33,13 +33,15 @@ Kanonikus új vault-idk: `provider:<provider>:api-key`, `agent:<id>:api-key` —
 
 ## Feature flagek
 
+A flagek a telepítés `.env`-jéből is olvasódnak (`src/runtime/env-flags.ts`; egy nem üres process-env érték nyer), mert a dashboard systemd-unitja nem tölti be a `.env`-et. Változtatás után dashboard-restart.
+
 | Változó | Értékek | Mit tesz |
 |---|---|---|
-| `MARVEEN_DEFAULT_RUNTIME` | runtime-név | Flotta-szintű default, ha az agent-config nem ad runtime-ot |
+| `MARVEEN_DEFAULT_RUNTIME` | runtime-név | Flotta-szintű default, ha az agent-config nem ad runtime-ot — csak ha a runtime ki tudja szolgálni az agent providerét (különben warning, provider-default) |
 | `MARVEEN_WORKER_RUNTIME` | `claude-tmux` (default) / `claude-headless` | A `runAgent()` egylövetű generálásai (scaffold, memória-digest, heartbeat) tmux-worker helyett headless child_process-ben |
 | `MARVEEN_BG_RUNTIME` | `legacy-tmux` (default) / runtime-név | Háttérfeladatok a runtime-adapteren (nincs `bg-*` tmux-session, élő kimenet az eseményfolyamból) |
 | `CHANNEL_BRIDGE` | `plugin` (default) / `marveen` | A fő-agent Telegram-hídja: Claude channels plugin vs. Marveen saját bridge |
-| `MODEL_ROUTING` | `off` (default) / `shadow` / `background` / `all` | Jev-router: csak naplóz / a háttérfeladat runtime+modelljét is választja / ugyanez + a Jev-routed headless session-agentek feladatonként váltanak |
+| `MODEL_ROUTING` | `off` (default) / `shadow` / `background` / `all` | Jev-router: csak naplóz / a háttérfeladat runtime+modelljét is választja / ugyanez + a Jev-routed headless session-agentek feladatonként váltanak. A `background`/`all` a **mérési kapu** (`store/model-routing-calibration.json`, docs/model-routing.md) nélkül `shadow`-ként fut |
 | `MARVEEN_RUNTIME_DUMP_DIR` | könyvtár | Nyers JSONL-eseményfolyam mentése fixture-rögzítéshez |
 | `MARVEEN_EXTRA_MCP_CONFIG` | fájl | Extra `--mcp-config` a `claude-tmux` indításhoz (a bridge MCP-szervere) |
 
@@ -50,8 +52,8 @@ A 29 hook-script (`scripts/hooks/`) változatlan. Ki futtatja:
 - **claude-***: natívan (`.claude/settings.json`).
 - **codex-cli**: natívan, `.codex/hooks.json` (a `bundle-render` generálja) + `scripts/hooks/shim/codex-hook.mjs` (tool-név alias, exit-kód/JSON továbbítás).
 - **gemini-cli**: natívan, `.gemini/settings.json` `hooks` + `scripts/hooks/shim/gemini-hook.mjs` (esemény- és tool-név fordítás oda-vissza).
-- **minimax-cli**: natívan, Claude-formátumú plugin (`~/.minimax/plugins/marveen-hooks-<agent>/.claude-plugin/plugin.json` + `hooks/hooks.json`, a settings.json hookjai változatlanul); a könyvtár jelenléte telepít, `mcode plugin enable <név> -m local` kapcsolja be.
-- **native-api**: in-process `PolicyEngine` (`src/runtime/policy/engine.ts`) minden tool-hívás előtt/után + `permissions.ts` (a Claude engedély-szintaxis kiértékelése).
+- **minimax-cli**: natívan, Claude-formátumú plugin (`~/.minimax/plugins/marveen-hooks-<SERVICE_ID>-<agent>/…`). Az mcode MINDEN telepített plugint minden futásra betölt, ezért minden hook-parancs a `scripts/hooks/shim/scope-hook.mjs` mögött fut: a payload `cwd`-je alapján csak a saját agent hívásain (élőben mérve: az mcode payloadja tartalmazza a `cwd`-t). A név telepítésenként egyedi, így egy dev-klón nem írja felül az éles agent pluginját; a régi, telepítés nélküli nevű plugint a saját telepítés az új telepítése után törli.
+- **native-api**: in-process `PolicyEngine` (`src/runtime/policy/engine.ts`) minden tool-hívás előtt/után + `permissions.ts` (a Claude engedély-szintaxis kiértékelése: `Bash(prefix:*)` és `Bash(curl *https://*)` is, összetett parancsok részenként; útvonalak normalizálva és realpath-olva). A biztonsági kapuk (egress, email, outgoing-copy, self-pace) időtúllépés/összeomlás esetén TILTANAK (fail-closed), a shimekben is.
 
 A `docs/runtime-parity.md` írja le a paritás-tesztet.
 
@@ -75,13 +77,17 @@ Egy sub-agent, akinek a feloldott runtime-ja nem `claude-tmux` (vagy Jev-routed)
 
 Beállítás a dashboardon: az agent kártyáján a modell-legördülő „Előfizetéses CLI-k” csoportja (csak a telepített ÉS bejelentkezett CLI-k tételei látszanak; forrás: `GET /api/models/available` → `subscription`), vagy kézzel az `agent-config.json`-ban: `"model": "minimax-m3", "runtime": "minimax-cli", "provider": "minimax", "authMode": "shared"`. A PUT `/api/agents/<id>` a `runtime`, `provider`, `modelRouting` mezőket is fogadja.
 
-Korlátok: nincs saját Telegram-bot (a channels plugin Claude-TUI-hoz kötött), nincs élő terminál, a pane-alapú őrök (stuck-input, reauth-healer, context-guard, auto-restart, model-fallback, channel-monitor plugin-fele) kihagyják; auth-/limit-hibát a loop jelez a kártyán (`runtimeState`) és egyszer az inbox-ba a fő-agentnek. Egy futó kör a runtime saját időkorlátjáig (mcode: `MARVEEN_AGENT_TIMEOUT_MS`, alapból 20 perc) tart; a leállítás a sort zárja, a folyó kört nem öli meg.
+Tartósság: minden elfogadott kör a `store/headless-agents/<agent>.queue.json` journalba kerül, MIELŐTT a router „sent”-et kap; befejezéskor kikerül. Dashboard-crash vagy leállítás után a következő indítás visszajátssza (egy futás közben megszakadt kör egy figyelmeztető előtaggal, hogy az agent ne ismételjen vakon mellékhatásokat). Auth-/kvóta-hibánál a kör `deferred` marad és az újraindításkor újra lefut. A sor korlátos (20), a readiness a sorban állókat is számolja. A leállítás a futó kört is megszakítja (a CLI teljes process-groupját). A futó CLI-gyerekek a `store/runtime-children.json`-ban vannak; a dashboard indításkor leállítja az előző folyamattól árván maradtakat.
+
+Korlátok: nincs saját Telegram-bot (a channels plugin Claude-TUI-hoz kötött), nincs élő terminál, a pane-alapú őrök (stuck-input, reauth-healer, context-guard, auto-restart, model-fallback, channel-monitor plugin-fele) kihagyják; auth-/limit-hibát a loop jelez a kártyán (`runtimeState`) és egyszer az inbox-ba a fő-agentnek.
 
 ### Jev-routed agent (`modelRouting: "jev"`, `MODEL_ROUTING=all`)
 
-A legördülő „Jev-routed” tétele (vagy `"modelRouting": "jev"` a configban): az agentnek nincs rögzített modellje. Indulás a `store/model-profile-map.json` `routine_lowcost` célján (egy `claude-tmux` cél `claude-headless`-ként fut), utána minden kézbesített feladatot a Jev besorol, a profil-térkép adja a runtime+modellt, és ha a hiszterézis (`shouldSwitch`: felfelé bármikor, lefelé csak két szint) engedi, a **következő** kör már az új célon, friss sessionnel fut (a napló `switch` sora mutatja). `MODEL_ROUTING=off|shadow|background` mellett a routed agent a kezdő célon marad és nem kérdezi a Jevet; `all` = `background` + a routed session-agentek. A fő-agent sosem routolt.
+A legördülő „Jev-routed” tétele (vagy `"modelRouting": "jev"` a configban) csak **effektív `all` módban** (MODEL_ROUTING=all ÉS nyitott mérési kapu) választható/menthető. Ilyenkor indulás a `store/model-profile-map.json` `routine_lowcost` célján (egy `claude-tmux` cél `claude-headless`-ként fut), utána minden kézbesített feladatot a Jev besorol, a profil-térkép adja a runtime+modellt, és ha a hiszterézis (`shouldSwitch`: felfelé bármikor, lefelé csak két szint) engedi, a **következő** kör már az új célon, friss sessionnel fut (a napló `switch` sora mutatja). Ha a routing nem alkalmazott (off/shadow/background, vagy zárt kapu), a routed agent a SAJÁT konfigurált modelljén fut, és a feladatai shadow-sort írnak (a mérés így gyűlik); `all` = `background` + a routed session-agentek. A fő-agent sosem routolt.
 
 ## Telegram-bridge (CHANNEL_BRIDGE=marveen)
+
+Biztonság: a kimenő toolok csak az owner-chatre, az `allowFrom` küldőkre és az engedélyezett csoportokba küldenek; a `send_file` csak az agent munkakönyvtárából és a bridge saját könyvtáraiból, titok-jellegű fájlt soha. A bridge reply/edit tooljai a `outgoing-copy-gate` és `ledger-outbound` matcherében vannak. A borítékban `sender_id` (numerikus) is van; egy csoport-bejegyzés saját `allowFrom`-mal szűkíthet. Tokenenként egyetlen poller (lock: `store/channel-bridge/poller.lock`); 409 esetén a státusz `conflict`. Az MCP-definíció nem tartalmaz bot-tokent (a szerver a `.env`-ből olvassa).
 
 `src/channel/`: grammY long polling → `store/channel-access.json` (allowlist/pairing) → `conversation_log` → `<channel …>` boríték (a plugin formátumával azonos) → a fő-agent runtime-ja. Válasz: a `plugin_telegram_bridge` MCP-szerver `reply`/`send_file`/`edit_message`/`react`/`typing`/`download_attachment` tooljai (`mcp__plugin_telegram_bridge__reply`). Indítás: a dashboarddal együtt (`CHANNEL_BRIDGE=marveen npm run dev`) vagy önállóan (`npm run channel`). Bridge-módban egy `claude-tmux` fő-agent `claude-headless`-ként fut (a TUI-út a `channels.sh` területe marad).
 
@@ -97,5 +103,6 @@ npm run morning:runtime                       # reggeli briefing bármely runtim
 ```
 
 ```bash
-npx tsx scripts/smoke-minimax-cli.ts            # MiniMax Code (login nélkül a hibaút)
+npx tsx scripts/smoke-minimax-cli.ts            # MiniMax Code: hook-payload (cwd), resume, a próba-plugin eltakarítása
+npx tsx scripts/smoke-headless-durability.ts a && npx tsx scripts/smoke-headless-durability.ts b   # crash közbeni kör visszajátszása
 ```

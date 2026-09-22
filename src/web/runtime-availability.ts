@@ -61,15 +61,17 @@ export function subscriptionEntriesFor(facts: {
     out.push({ id: 'minimax-m3', label: 'MiniMax M3 (előfizetés, MiniMax Code)', runtime: 'minimax-cli', provider: 'minimax', authMode: 'shared', runtimeAuth: 'subscription' })
     out.push({ id: 'minimax-m2.7-highspeed', label: 'MiniMax M2.7 highspeed (előfizetés, MiniMax Code)', runtime: 'minimax-cli', provider: 'minimax', authMode: 'shared', runtimeAuth: 'subscription' })
   }
+  // Codex / Gemini are labelled experimental until a live logged-in run has
+  // been recorded (docs/runtime-parity.md); MiniMax is live-verified.
   // Codex / Gemini ids follow docs/runtime.md and src/runtime/model-catalog.ts;
   // the CLI validates the name on the first turn, and a wrong one surfaces as
   // an 'error' row in the agent's session log rather than a silent fallback.
   if (facts.codex.installed && facts.codex.loggedIn) {
-    out.push({ id: 'gpt-5.6-sol', label: 'GPT-5.6 sol (ChatGPT-előfizetés, Codex CLI)', runtime: 'codex-cli', provider: 'openai', authMode: 'shared', runtimeAuth: 'subscription' })
+    out.push({ id: 'gpt-5.6-sol', label: 'GPT-5.6 sol (ChatGPT-előfizetés, Codex CLI) -- kísérleti, élőben még nem ellenőrzött', runtime: 'codex-cli', provider: 'openai', authMode: 'shared', runtimeAuth: 'subscription' })
   }
   if (facts.gemini.installed && facts.gemini.loggedIn) {
-    out.push({ id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (Google-előfizetés, Gemini CLI)', runtime: 'gemini-cli', provider: 'google', authMode: 'shared', runtimeAuth: 'subscription' })
-    out.push({ id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (Google-előfizetés, Gemini CLI)', runtime: 'gemini-cli', provider: 'google', authMode: 'shared', runtimeAuth: 'subscription' })
+    out.push({ id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (Google-előfizetés, Gemini CLI) -- kísérleti, élőben még nem ellenőrzött', runtime: 'gemini-cli', provider: 'google', authMode: 'shared', runtimeAuth: 'subscription' })
+    out.push({ id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (Google-előfizetés, Gemini CLI) -- kísérleti, élőben még nem ellenőrzött', runtime: 'gemini-cli', provider: 'google', authMode: 'shared', runtimeAuth: 'subscription' })
   }
   return out
 }
