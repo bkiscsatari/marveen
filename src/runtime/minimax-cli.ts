@@ -198,17 +198,22 @@ export function prepareMinimaxBundle(spec: AgentSpec, opts: { permissionMode?: '
   return { configPath, agentsMdPath, pluginDir, pluginName, skippedHooks, mcpPath }
 }
 
-const installedPlugins = new Set<string>()
+// A directory under $MINIMAX_DATA_DIR/plugins is discovered as an INSTALLED
+// local plugin automatically (measured 2026-09-22: `plugin list -m local`
+// reports installed+enabled right after the files are written; `plugin add`
+// answers LOCAL_PLUGIN_INSTALL_UNSUPPORTED for the local marketplace). Only an
+// explicit enable is needed in case it was disabled earlier.
+const enabledPlugins = new Set<string>()
 function ensurePluginInstalled(name: string): void {
-  if (installedPlugins.has(name)) return
-  for (const args of [['plugin', 'add', name, '-m', 'local', '--json'], ['plugin', 'enable', name, '-m', 'local', '--json']]) {
-    try { execFileSync(mcodeBin(), args, { encoding: 'utf-8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] }) }
-    catch (err) {
-      const out = `${(err as { stdout?: string }).stdout ?? ''} ${(err as { stderr?: string }).stderr ?? ''}`
-      if (!/already|exists|enabled/i.test(out)) logger.warn({ name, args: args.slice(0, 2), out: out.slice(0, 200) }, 'minimax-cli: plugin install step failed (hooks may not run natively)')
-    }
+  if (enabledPlugins.has(name)) return
+  try {
+    const out = execFileSync(mcodeBin(), ['plugin', 'enable', name, '-m', 'local', '--json'], { encoding: 'utf-8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MINIMAX_DATA_DIR: minimaxDataDir() } })
+    if (!/"enabled":\s*true/.test(out)) logger.warn({ name, out: out.slice(0, 200) }, 'minimax-cli: plugin not reported enabled (hooks may not run natively)')
+  } catch (err) {
+    const out = `${(err as { stdout?: string }).stdout ?? ''} ${(err as { stderr?: string }).stderr ?? ''}`
+    logger.warn({ name, out: out.slice(0, 200) }, 'minimax-cli: plugin enable failed (hooks may not run natively)')
   }
-  installedPlugins.add(name)
+  enabledPlugins.add(name)
 }
 
 interface Session { spec: AgentSpec; sessionId: string | null; chain: Promise<unknown>; inFlight: number; lastResult: RunResult | null; usage: UsageRecord[]; authFailed: boolean }
@@ -301,22 +306,21 @@ export const minimaxCliRuntime: AgentRuntime = {
     const from = typeof cursor?.value === 'number' ? cursor.value : 0
     return { records: all.slice(from), cursor: { value: all.length } }
   },
-  // Cheap probe: `mcode provider list` prints "minimax_oauth active managed login" when signed in.
+  // `mcode provider list` only reports the configured credential SOURCE
+  // ("minimax_oauth active" even when logged out -- measured 2026-09-22), so
+  // the probe is a real one-step exec: exit 3 / "Sign in to MiniMax" = no login.
   async healthProbe(agent: AgentSpec): Promise<HealthProbeResult> {
     let version = ''
     try { version = execFileSync(mcodeBin(), ['--version'], { encoding: 'utf-8', timeout: 15_000 }).trim() } catch (err) { return { ok: false, detail: `mcode not runnable: ${(err as Error).message}` } }
     if (agent.authMode === 'api') {
       const { getSecret } = await import('../web/vault.js')
       const key = lookupProviderSecret('minimax', agent.id, (id) => { try { return getSecret(id) } catch { return null } })
-      return key ? { ok: true, detail: `mcode ${version}; api key from vault (${key.id})` } : { ok: false, detail: `mcode ${version}; no MiniMax key in vault (expected MINIMAX_API_KEY / provider:minimax:api-key)` }
+      if (!key) return { ok: false, detail: `mcode ${version}; no MiniMax key in vault (expected MINIMAX_API_KEY / provider:minimax:api-key)` }
     }
-    try {
-      const out = execFileSync(mcodeBin(), ['provider', 'list'], { encoding: 'utf-8', timeout: 20_000, env: { ...process.env, MINIMAX_DATA_DIR: minimaxDataDir() } })
-      const signedIn = /minimax_oauth\s+active/i.test(out)
-      return signedIn ? { ok: true, detail: `mcode ${version}; MiniMax login active` } : { ok: false, detail: `mcode ${version}; not signed in (run: mcode login --region global --no-browser)` }
-    } catch (err) {
-      return { ok: false, detail: `mcode ${version}; provider list failed: ${(err as Error).message.slice(0, 120)}` }
-    }
+    const r = await runOnce({ ...agent, model: process.env.MARVEEN_MINIMAX_PROBE_MODEL || 'minimax-m2.7-highspeed' }, 'Reply with exactly: OK', { timeoutMs: 90_000, timeoutAsError: true, allowTools: false })
+    if (r.text && /\bOK\b/i.test(r.text)) return { ok: true, detail: `mcode ${version}; answered on ${r.usage?.model ?? 'minimax'} (${agent.authMode})` }
+    const auth = /exit=3|Sign in to MiniMax|mcode login/i.test(r.reason ?? '')
+    return { ok: false, detail: `mcode ${version}; ${auth ? 'not signed in (run: mcode login --region global --no-browser)' : (r.reason ?? 'unexpected reply').slice(0, 200)}` }
   },
 }
 

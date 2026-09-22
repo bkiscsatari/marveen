@@ -50,7 +50,7 @@ A 29 hook-script (`scripts/hooks/`) változatlan. Ki futtatja:
 - **claude-***: natívan (`.claude/settings.json`).
 - **codex-cli**: natívan, `.codex/hooks.json` (a `bundle-render` generálja) + `scripts/hooks/shim/codex-hook.mjs` (tool-név alias, exit-kód/JSON továbbítás).
 - **gemini-cli**: natívan, `.gemini/settings.json` `hooks` + `scripts/hooks/shim/gemini-hook.mjs` (esemény- és tool-név fordítás oda-vissza).
-- **minimax-cli**: natívan, Claude-formátumú plugin (`~/.minimax/plugins/marveen-hooks-<agent>/.claude-plugin/plugin.json` + `hooks/hooks.json`, a settings.json hookjai változatlanul), `mcode plugin add … -m local`.
+- **minimax-cli**: natívan, Claude-formátumú plugin (`~/.minimax/plugins/marveen-hooks-<agent>/.claude-plugin/plugin.json` + `hooks/hooks.json`, a settings.json hookjai változatlanul); a könyvtár jelenléte telepít, `mcode plugin enable <név> -m local` kapcsolja be.
 - **native-api**: in-process `PolicyEngine` (`src/runtime/policy/engine.ts`) minden tool-hívás előtt/után + `permissions.ts` (a Claude engedély-szintaxis kiértékelése).
 
 A `docs/runtime-parity.md` írja le a paritás-tesztet.
