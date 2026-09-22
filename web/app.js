@@ -3526,24 +3526,13 @@ function renderAgents() {
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           ${t('agents.btn.conversation')}
         </button>
-        ${agent.headless ? `
-        <button class="btn-secondary btn-compact agent-session-log-btn" title="A headless session-agent köreinek naplója (be/ki/váltás/hiba)">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
-          Napló
-        </button>` : `
         <button class="btn-secondary btn-compact agent-terminal-btn" title="Terminal">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
           Terminal
-        </button>`}
+        </button>
       </div>
       <div class="agent-card-activity"></div>
     `
-    // Session log (headless agents only): the turn log stands in for the
-    // Claude transcript the Conversation view would otherwise read.
-    card.querySelector('.agent-session-log-btn')?.addEventListener('click', (e) => {
-      e.stopPropagation()
-      openSessionLog(agent.name, label)
-    })
     mCard.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openTerminalModal(mainAgentId())
     })
@@ -3612,13 +3601,24 @@ function renderAgents() {
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           ${t('agents.btn.conversation')}
         </button>
+        ${agent.headless ? `
+        <button class="btn-secondary btn-compact agent-session-log-btn" title="A headless session-agent köreinek naplója (be/ki/váltás/hiba)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+          Napló
+        </button>` : `
         <button class="btn-secondary btn-compact agent-terminal-btn" title="Terminal">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
           Terminal
-        </button>
+        </button>`}
       </div>
       <div class="agent-card-activity"></div>
     `
+    // Session log (headless agents only): the turn log stands in for the
+    // Claude transcript the Conversation view would otherwise read.
+    card.querySelector('.agent-session-log-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      openSessionLog(agent.name, label)
+    })
     // Login button handler (start → confirm flow)
     card.querySelectorAll('.agent-login-btn').forEach(btn => {
       btn.addEventListener('click', (e) => { e.stopPropagation(); handleAgentLogin(agent.name, btn) })
