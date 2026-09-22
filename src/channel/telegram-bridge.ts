@@ -12,7 +12,7 @@
 // unit-testable without Telegram; grammY is only touched in start()/stop().
 
 import { Bot, GrammyError, HttpError, type Context } from 'grammy'
-import { mkdirSync, createWriteStream } from 'node:fs'
+import { mkdirSync, createWriteStream, writeFileSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
@@ -89,7 +89,7 @@ export async function handleInbound(msg: InboundMessage, deps: BridgeDeps): Prom
   const text = msg.text || (msg.photo ? '[kép]' : msg.voice ? '[hangüzenet]' : msg.document ? `[fájl: ${msg.document.fileName ?? 'melléklet'}]` : '')
   ;(deps.ledger ?? { logInbound }).logInbound(deps.agentId, msg.chatId, msg.messageId, text, msg.tsIso, { kind: attachmentKind, fileId: attachmentFileId })
   const envelope = buildChannelEnvelope({
-    chatId: msg.chatId, messageId: msg.messageId, user: msg.senderName ?? msg.senderId, ts: msg.tsIso, text,
+    chatId: msg.chatId, messageId: msg.messageId, user: msg.senderName ?? msg.senderId, senderId: msg.senderId, ts: msg.tsIso, text,
     imagePath, attachmentKind, attachmentFileId, attachmentPath, replyToMessageId: msg.replyToMessageId, chatTitle: msg.chatTitle,
   })
   try {
@@ -123,12 +123,47 @@ export function inboundFromContext(ctx: Context): InboundMessage | null {
   }
 }
 
+export type PollerStatus = 'stopped' | 'polling' | 'conflict' | 'error'
+
 export interface TelegramBridge {
   start(): Promise<void>
   stop(): Promise<void>
   sendText(chatId: string, text: string): Promise<number | null>
   typing(chatId: string): Promise<void>
   botUsername(): string | null
+  /** What the poller is really doing -- a 409 no longer reads as "running". */
+  status(): { state: PollerStatus; detail: string | null }
+}
+
+// ONE getUpdates poller per bot token per install: the dashboard boot and the
+// standalone channel-service can both start the bridge, and two pollers on one
+// token fight with 409 Conflict. A pid lock file in the state dir decides; a
+// lock whose pid is gone is stale and taken over.
+export function acquirePollerLock(stateDir: string, pid: number = process.pid, isAlive: (p: number) => boolean = pidAlive): { ok: true } | { ok: false; holder: number } {
+  const lock = join(stateDir, 'poller.lock')
+  mkdirSync(stateDir, { recursive: true })
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(lock, JSON.stringify({ pid, startedAt: Date.now() }), { flag: 'wx', mode: 0o600 })
+      return { ok: true }
+    } catch {
+      let holder = 0
+      try { holder = Number(JSON.parse(readFileSync(lock, 'utf-8')).pid) || 0 } catch { holder = 0 }
+      if (holder === pid) return { ok: true }
+      if (holder && isAlive(holder)) return { ok: false, holder }
+      try { unlinkSync(lock) } catch { /* raced */ }
+    }
+  }
+  return { ok: false, holder: 0 }
+}
+
+export function releasePollerLock(stateDir: string, pid: number = process.pid): void {
+  const lock = join(stateDir, 'poller.lock')
+  try { if (Number(JSON.parse(readFileSync(lock, 'utf-8')).pid) === pid) unlinkSync(lock) } catch { /* not ours / gone */ }
+}
+
+function pidAlive(p: number): boolean {
+  try { process.kill(p, 0); return true } catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM' }
 }
 
 export function createTelegramBridge(opts: {
@@ -179,21 +214,43 @@ export function createTelegramBridge(opts: {
     else logger.error({ err: e }, 'telegram-bridge: handler error')
   })
   let started = false
+  let pollState: PollerStatus = 'stopped'
+  let pollDetail: string | null = null
   return {
     async start() {
       if (started) return
-      started = true
       mkdirSync(opts.stateDir, { recursive: true })
+      const lock = acquirePollerLock(opts.stateDir)
+      if (!lock.ok) {
+        pollState = 'conflict'
+        pollDetail = `another bridge poller holds ${join(opts.stateDir, 'poller.lock')} (pid ${lock.holder})`
+        throw new Error(`telegram-bridge: ${pollDetail}`)
+      }
+      started = true
       const me = await bot.api.getMe()
       username = me.username ?? null
-      // Not awaited: bot.start() resolves only when polling stops. 409 Conflict
-      // (another poller on the same token) surfaces through bot.catch/log.
+      // Not awaited: bot.start() resolves only when polling stops. A 409
+      // Conflict (a poller outside this install, e.g. the plugin) ends polling:
+      // the status says so instead of staying "running" forever.
+      pollState = 'polling'; pollDetail = null
       void bot.start({ drop_pending_updates: false, onStart: () => logger.info({ username }, 'telegram-bridge: polling started') })
-        .catch((err) => logger.error({ err }, 'telegram-bridge: polling stopped with error'))
+        .catch((err) => {
+          const conflict = err instanceof GrammyError && err.error_code === 409
+          pollState = conflict ? 'conflict' : 'error'
+          pollDetail = conflict ? '409 Conflict: another getUpdates poller uses this bot token' : String((err as Error)?.message ?? err).slice(0, 200)
+          started = false
+          releasePollerLock(opts.stateDir)
+          logger.error({ err, conflict }, 'telegram-bridge: polling stopped with error')
+        })
     },
-    async stop() { if (started) { started = false; await bot.stop() } },
+    async stop() {
+      if (started) { started = false; await bot.stop() }
+      pollState = 'stopped'; pollDetail = null
+      releasePollerLock(opts.stateDir)
+    },
     sendText,
     async typing(chatId) { try { await bot.api.sendChatAction(chatId, 'typing') } catch { /* best effort */ } },
     botUsername: () => username,
+    status: () => ({ state: pollState, detail: pollDetail }),
   }
 }

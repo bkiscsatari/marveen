@@ -32,7 +32,17 @@ export function channelBridgeMode(env: NodeJS.ProcessEnv = flagEnv()): ChannelBr
   return (env.CHANNEL_BRIDGE || '').trim().toLowerCase() === 'marveen' ? 'marveen' : 'plugin'
 }
 
-/** The bridge MCP server definition every runtime gets for the main agent. */
+/**
+ * The bridge MCP server definition every runtime gets for the main agent.
+ *
+ * NO bot token in it: every runtime renders this definition into a config
+ * file (.codex/config.toml, .gemini/settings.json, .mcp.json, an mcp-config
+ * json), and the first version put TELEGRAM_BOT_TOKEN there in plain text,
+ * world-readable. The server reads the token from the install's .env itself
+ * (mcp-server.ts resolveConfig, MARVEEN_PROJECT_ROOT), so nothing secret
+ * leaves .env. `token` is honoured only when a caller passes one explicitly
+ * (tests / a non-.env deployment), never by default.
+ */
 export function bridgeMcpServerDef(opts: { root?: string; token?: string; agentId?: string; ownerChat?: string | null } = {}): McpServerDef {
   const root = opts.root ?? PROJECT_ROOT
   const entry = existsSync(join(root, 'dist', 'channel', 'mcp-server.js'))
@@ -45,7 +55,7 @@ export function bridgeMcpServerDef(opts: { root?: string; token?: string; agentI
     env: {
       MARVEEN_PROJECT_ROOT: root,
       MARVEEN_AGENT_ID: opts.agentId ?? MAIN_AGENT_ID,
-      TELEGRAM_BOT_TOKEN: opts.token ?? TELEGRAM_BOT_TOKEN,
+      ...(opts.token ? { TELEGRAM_BOT_TOKEN: opts.token } : {}),
       ALLOWED_CHAT_ID: opts.ownerChat ?? ALLOWED_CHAT_ID,
     },
   }
@@ -88,7 +98,13 @@ export async function startChannelBridge(): Promise<{ ok: boolean; detail: strin
       if (out !== 'sent') logger.warn({ out }, 'channel-bridge: delivery not sent')
     },
   })
-  await st.bridge.start()
+  try {
+    await st.bridge.start()
+  } catch (err) {
+    try { await runtime.stop(handle) } catch { /* best effort */ }
+    logger.error({ err }, 'channel-bridge: not started')
+    return { ok: false, detail: (err as Error).message }
+  }
   state = st
   // Typing indicator while the agent works; reply-guard nudges when it idles with an open question.
   st.timers.push(setInterval(() => { void tick(st) }, 5_000))
@@ -130,6 +146,8 @@ export async function stopChannelBridge(): Promise<void> {
   try { await st.runtime.stop(st.handle) } catch { /* best effort */ }
 }
 
-export function channelBridgeStatus(): { running: boolean; runtime?: RuntimeKind; model?: string; bot?: string | null } {
-  return state ? { running: true, runtime: state.spec.runtime, model: state.spec.model, bot: state.bridge.botUsername() } : { running: false }
+export function channelBridgeStatus(): { running: boolean; runtime?: RuntimeKind; model?: string; bot?: string | null; poller?: string; detail?: string | null } {
+  if (!state) return { running: false }
+  const p = state.bridge.status()
+  return { running: p.state === 'polling', runtime: state.spec.runtime, model: state.spec.model, bot: state.bridge.botUsername(), poller: p.state, detail: p.detail }
 }

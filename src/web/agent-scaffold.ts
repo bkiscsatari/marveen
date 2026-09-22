@@ -996,8 +996,10 @@ export function injectEgressGate(existing: Record<string, unknown>): void {
 // Which Telegram tools carry copyable text out of the install. `reply` is the
 // send route; `edit_message` rewrites a message already on the phone and can
 // just as easily replace a working code block with a broken one.
+// The Marveen bridge's tools (CHANNEL_BRIDGE=marveen, src/channel/mcp-server.ts)
+// carry the same text out and must hit the same gate.
 export const TELEGRAM_COPY_GATE_MATCHER =
-  'mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__edit_message'
+  'mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__edit_message|mcp__plugin_telegram_bridge__reply|mcp__plugin_telegram_bridge__edit_message'
 
 // Which agents get the outgoing-copy gate on their Telegram send tools: every
 // sub-agent. The MAIN agent is exempt HERE only because it already carries the

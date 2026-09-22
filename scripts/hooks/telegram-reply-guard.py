@@ -141,7 +141,7 @@ def main():
     reason = (
         f"⚠️ VÁLASZOLATLAN TELEGRAM-ÜZENET (chat_id={chat_id}): \"{snippet}\"\n"
         f"A fordulót NEM zárhatod le, amíg NEM küldtél Telegram-választ a "
-        f"mcp__plugin_telegram_telegram__reply toolon keresztül (chat_id={chat_id}). "
+        f"Telegram reply toolon keresztül (mcp__plugin_telegram_telegram__reply, bridge módban mcp__plugin_telegram_bridge__reply; chat_id={chat_id}). "
         f"A sima szöveges (assistant text) kimenet NEM jut el a felhasználóhoz -- "
         f"ő csak a Telegramot látja. Küldd el a választ a reply toollal MOST, "
         f"utána zárhatod a fordulót."

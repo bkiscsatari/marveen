@@ -31,6 +31,8 @@ export interface AccessFile {
 export const ACCESS_PATH = join(STORE_DIR, 'channel-access.json')
 export const PLUGIN_ACCESS_PATH = join(homedir(), '.claude', 'channels', 'telegram', 'access.json')
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000
+export const MAX_PENDING = 20
+export { allowedOutboundChats } from './outbound-policy.js'
 
 export function readAccess(path: string = ACCESS_PATH): AccessFile {
   try { return JSON.parse(readFileSync(path, 'utf-8')) as AccessFile } catch { return {} }
@@ -70,9 +72,16 @@ export function decideAccess(access: AccessFile, msg: { senderId: string; chatId
   if (policy === 'disabled') return { kind: 'deny', reason: 'channel disabled' }
   const allow = (access.allowFrom ?? []).map(String)
   if (msg.isGroup) {
-    return access.groups && Object.prototype.hasOwnProperty.call(access.groups, msg.chatId)
-      ? { kind: 'allow' }
-      : { kind: 'deny', reason: 'group not allowed' }
+    if (!access.groups || !Object.prototype.hasOwnProperty.call(access.groups, msg.chatId)) return { kind: 'deny', reason: 'group not allowed' }
+    // Plugin semantics: a group entry may narrow who is heard with its own
+    // allowFrom; an empty/absent list means every member. Either way the
+    // envelope carries the numeric sender_id, so a member cannot pass as the
+    // owner by picking the owner's display name.
+    const g = access.groups[msg.chatId]
+    const groupAllow = g && typeof g === 'object' && Array.isArray((g as { allowFrom?: unknown }).allowFrom)
+      ? ((g as { allowFrom: unknown[] }).allowFrom).map(String) : []
+    if (groupAllow.length && !groupAllow.includes(msg.senderId)) return { kind: 'deny', reason: 'sender not in the group allowFrom' }
+    return { kind: 'allow' }
   }
   if (allow.includes(msg.senderId)) return { kind: 'allow' }
   if (policy !== 'pairing') return { kind: 'deny', reason: 'sender not in allowFrom' }
@@ -81,7 +90,11 @@ export function decideAccess(access: AccessFile, msg: { senderId: string; chatId
     if (p.expiresAt < now) { delete access.pending[code]; continue }
     if (p.senderId === msg.senderId) { p.replies = (p.replies ?? 0) + 1; return { kind: 'pairing-pending', code } }
   }
-  const code = String(randomInt(100000, 999999))
+  // Bounded: a flood of strangers must not grow the file (or the owner's
+  // approval list) without limit.
+  if (Object.keys(access.pending).length >= MAX_PENDING) return { kind: 'deny', reason: 'too many pending pairing requests' }
+  let code = String(randomInt(100000, 999999))
+  while (access.pending[code]) code = String(randomInt(100000, 999999)) // never overwrite a live code
   access.pending[code] = { senderId: msg.senderId, chatId: msg.chatId, createdAt: now, expiresAt: now + PENDING_TTL_MS, replies: 0, name: msg.senderName }
   return { kind: 'pairing-issued', code }
 }

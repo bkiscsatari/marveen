@@ -15,6 +15,8 @@ export interface EnvelopeInput {
   chatId: string | number
   messageId: string | number
   user?: string
+  /** Numeric Telegram user id: the identity, unlike the self-chosen display name. */
+  senderId?: string | number
   /** ISO-8601 UTC ("Z" suffix). */
   ts: string
   text: string
@@ -28,19 +30,23 @@ export interface EnvelopeInput {
 
 function attr(name: string, v: string | number | undefined): string {
   if (v === undefined || v === null || v === '') return ''
-  return ` ${name}="${String(v).replace(/"/g, '&quot;').replace(/\n/g, ' ')}"`
+  // `<` / `>` escaped too: a `>` in a display name or chat title cut
+  // ledger-capture's `([^>]*)` attribute group short and moved ts/image_path
+  // into the body. `&` is left alone so existing ids/paths stay byte-identical.
+  return ` ${name}="${String(v).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\r\n]/g, ' ')}"`
 }
 
 export function buildChannelEnvelope(i: EnvelopeInput): string {
   const attrs = [
-    attr('chat_id', i.chatId), attr('message_id', i.messageId), attr('user', i.user), attr('ts', i.ts),
+    attr('chat_id', i.chatId), attr('message_id', i.messageId), attr('user', i.user), attr('sender_id', i.senderId), attr('ts', i.ts),
     attr('reply_to_message_id', i.replyToMessageId), attr('chat_title', i.chatTitle),
     attr('image_path', i.imagePath), attr('attachment_kind', i.attachmentKind),
     attr('attachment_file_id', i.attachmentFileId), attr('attachment_path', i.attachmentPath),
   ].join('')
-  // A closing tag inside the body would let a sender forge the end of the
-  // envelope; the ledger regex is non-greedy on `</channel>`.
-  const body = i.text.replace(/<\/channel>/gi, '&lt;/channel&gt;')
+  // Neither a closing NOR an opening channel tag may appear in the body: a
+  // sender could otherwise forge the end of the envelope (the ledger regex is
+  // non-greedy on `</channel>`) or nest a fake envelope with its own source.
+  const body = i.text.replace(/<\/channel>/gi, '&lt;/channel&gt;').replace(/<channel\b/gi, '&lt;channel')
   return `<channel source="${BRIDGE_SOURCE}"${attrs}>\n${body}\n</channel>`
 }
 
@@ -53,7 +59,7 @@ export function parseChannelEnvelopes(prompt: string): ParsedEnvelope[] {
   const out: ParsedEnvelope[] = []
   for (const m of prompt.matchAll(CHANNEL_RX)) {
     const attrs: Record<string, string> = {}
-    for (const a of m[1].matchAll(/([a-z_]+)="([^"]*)"/g)) attrs[a[1]] = a[2].replace(/&quot;/g, '"')
+    for (const a of m[1].matchAll(/([a-z_]+)="([^"]*)"/g)) attrs[a[1]] = a[2].replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     const src = m[0].match(/source="([^"]+)"/)?.[1] ?? ''
     out.push({ source: src, attrs, text: m[2].trim() })
   }
