@@ -35,6 +35,7 @@ const BUILTIN_LOADERS: Partial<Record<RuntimeKind, Loader>> = {
   'claude-headless': () => import('./claude-headless.js'),
   'codex-cli': () => import('./codex-cli.js'),
   'gemini-cli': () => import('./gemini-cli.js'),
+  'native-api': () => import('./native-api/index.js'),
 }
 
 export function registerRuntime(rt: AgentRuntime): void {
