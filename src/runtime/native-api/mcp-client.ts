@@ -57,8 +57,8 @@ export async function mcpToolSet(conns: McpConnection[], ctx: ToolContext): Prom
       tools[id] = dynamicTool({
         description: t.description ?? `${t.name} on MCP server ${c.name}`,
         inputSchema: jsonSchema(schema as never),
-        execute: async (input) => gated(ctx, id, null, input, async () => {
-          const r = await c.client.callTool({ name: t.name, arguments: (input ?? {}) as Record<string, unknown> })
+        execute: async (input) => gated(ctx, id, () => null, input, async (i) => {
+          const r = await c.client.callTool({ name: t.name, arguments: (i ?? {}) as Record<string, unknown> })
           const content = Array.isArray(r.content) ? r.content : []
           const text = content.map((b) => {
             const blk = b as { type?: string; text?: string; mimeType?: string }

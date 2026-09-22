@@ -79,7 +79,7 @@ describe('built-in tools with permission + hook gates', () => {
     expect(String(await exec('ListDir', {}))).toContain('note.txt')
   })
   it('gated() reports thrown errors as ERROR text instead of failing the run', async () => {
-    const r = await gated(ctx, 'Read', join(dir, 'x'), {}, async () => { throw new Error('boom') })
+    const r = await gated(ctx, 'Read', () => join(dir, 'x'), {}, async () => { throw new Error('boom') })
     expect(r).toBe('ERROR: Read failed -- boom')
   })
 })

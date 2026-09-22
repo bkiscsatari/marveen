@@ -8,8 +8,10 @@
 //   exit 2 : BLOCK (stderr = reason)             exit 0: allow, stdout parsed
 //   stdout : JSON {decision:"deny"|"block"|"allow", reason, hookSpecificOutput:{permissionDecision, permissionDecisionReason, updatedInput, additionalContext}}
 //            or plain text = additional context injected into the prompt
-//   other exit codes: non-fatal warning (allow)
-// Matchers are regexes on the tool name (empty = all). Timeouts in seconds.
+//   other exit codes: non-fatal warning (allow) -- EXCEPT the security gates in
+//            FAIL_CLOSED_HOOK_RX on PreToolUse, where a crash/timeout denies
+// Matchers: regex on the tool name (empty/"*" = all; SessionStart matches the
+// source, PreCompact the trigger). Timeouts in seconds.
 
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
@@ -51,24 +53,66 @@ export interface PolicyDecision {
 
 const DEFAULT_TIMEOUT_S = 60
 
-export function hooksFor(config: ClaudeHooksConfig | null | undefined, event: HookEventName, toolName: string | undefined): ClaudeHookEntry[] {
+/**
+ * Claude Code matcher semantics: empty or "*" matches everything; otherwise a
+ * regex over the whole value. A matcher that is not a valid regex is compared
+ * literally -- it must never throw (the first version re-threw on "*", which
+ * silently dropped the whole PostToolUse event on native-api).
+ */
+export function matcherMatches(matcher: string | undefined, value: string): boolean {
+  const m = (matcher ?? '').trim()
+  if (!m || m === '*') return true
+  try {
+    return new RegExp(`^(?:${m})$`).test(value)
+  } catch {
+    return m === value
+  }
+}
+
+/**
+ * Hooks for one event. The matcher is checked against the tool name for tool
+ * events, against the `source` (startup|resume|clear|compact) for SessionStart
+ * and against the trigger (manual|auto) for PreCompact; Claude Code ignores
+ * it for UserPromptSubmit/Stop, and so does this.
+ */
+export function hooksFor(
+  config: ClaudeHooksConfig | null | undefined,
+  event: HookEventName,
+  toolName: string | undefined,
+  matchValue?: string,
+): ClaudeHookEntry[] {
   const out: ClaudeHookEntry[] = []
+  const value = toolName ?? matchValue
+  const matcherApplies = event === 'PreToolUse' || event === 'PostToolUse' || event === 'SessionStart' || event === 'PreCompact'
   for (const g of config?.[event] ?? []) {
-    if (g.matcher && g.matcher.trim() && toolName !== undefined) {
-      let rx: RegExp
-      try { rx = new RegExp(`^(?:${g.matcher})$`) } catch { rx = new RegExp(g.matcher) }
-      if (!rx.test(toolName)) continue
-    } else if (g.matcher && g.matcher.trim() && toolName === undefined && event !== 'PreCompact' && event !== 'SessionStart') {
-      // A matcher on a non-tool event (Claude Code ignores it for UserPromptSubmit/Stop) -> run.
-    }
+    if (matcherApplies && value !== undefined && !matcherMatches(g.matcher, value)) continue
     for (const h of g.hooks ?? []) if (h.type === 'command' && h.command) out.push(h)
   }
   return out
 }
 
+/**
+ * Security gates whose FAILURE must not look like consent. Claude Code runs
+ * every hook fail-open (a crash or timeout is a warning), and so did this
+ * engine; for these gates that meant "the send/fetch went out because the
+ * checker died". On PreToolUse they now fail CLOSED on a timeout, a spawn
+ * error or an exit code other than 0/2 -- the same rule the Codex/Gemini shims
+ * apply. Telemetry and continuity hooks keep the fail-open behaviour.
+ */
+export const FAIL_CLOSED_HOOK_RX = /(egress-gate\.mjs|email-send-gate\.mjs|email-approval-gate\.py|gmail-draft-send-gate\.py|outgoing-copy-gate\.py|self-pace-gate\.mjs)/
+
+export function isFailClosedHook(command: string): boolean {
+  return FAIL_CLOSED_HOOK_RX.test(command)
+}
+
 /** Pure: interpret one hook's reply in the Claude Code dialect. */
-export function interpretHookReply(o: HookRunOutcome): { deny: boolean; reason?: string; updatedInput?: unknown; context?: string } {
+export function interpretHookReply(o: HookRunOutcome, opts: { failClosed?: boolean } = {}): { deny: boolean; reason?: string; updatedInput?: unknown; context?: string } {
   const out = o.stdout.trim()
+  if (opts.failClosed) {
+    if (o.timedOut) return { deny: true, reason: `security gate timed out (${o.hook.slice(0, 120)}) -- denied (fail-closed)` }
+    if (o.exitCode === null) return { deny: true, reason: `security gate could not run (${o.stderr.trim().slice(0, 200)}) -- denied (fail-closed)` }
+    if (o.exitCode !== 0 && o.exitCode !== 2) return { deny: true, reason: `security gate failed with exit ${o.exitCode} (${o.stderr.trim().slice(0, 200)}) -- denied (fail-closed)` }
+  }
   if (o.timedOut) return { deny: false, reason: `hook timed out (${o.hook}) -- allowed (fail-open on timeout)` }
   if (o.exitCode === 2) return { deny: true, reason: (o.stderr.trim() || out || `blocked by ${o.hook}`).slice(0, 500) }
   if (!out) return { deny: false }
@@ -119,8 +163,8 @@ export class PolicyEngine {
     })
   }
 
-  private async fire(event: HookEventName, toolName: string | undefined, extra: Record<string, unknown>): Promise<PolicyDecision> {
-    const hooks = hooksFor(this.config, event, toolName)
+  private async fire(event: HookEventName, toolName: string | undefined, extra: Record<string, unknown>, matchValue?: string): Promise<PolicyDecision> {
+    const hooks = hooksFor(this.config, event, toolName, matchValue)
     const decision: PolicyDecision = { allowed: true, additionalContext: [], outcomes: [] }
     if (!hooks.length) return decision
     const payload = this.payload(event, extra)
@@ -128,7 +172,7 @@ export class PolicyEngine {
     for (const h of hooks) {
       const o = await this.runHook(h, payload)
       decision.outcomes.push(o)
-      const r = interpretHookReply(o)
+      const r = interpretHookReply(o, { failClosed: event === 'PreToolUse' && isFailClosedHook(h.command ?? '') })
       if (r.context) decision.additionalContext.push(r.context)
       if (r.updatedInput !== undefined) decision.updatedInput = r.updatedInput
       if (r.deny) {
@@ -154,11 +198,11 @@ export class PolicyEngine {
     return this.fire('UserPromptSubmit', undefined, { prompt })
   }
   /** Turn end; a deny means "do not stop yet" (e.g. telegram-reply-guard). */
-  stop(lastAssistantText: string | null): Promise<PolicyDecision> {
-    return this.fire('Stop', undefined, { stop_hook_active: false, last_assistant_message: lastAssistantText ?? '' })
+  stop(lastAssistantText: string | null, stopHookActive = false): Promise<PolicyDecision> {
+    return this.fire('Stop', undefined, { stop_hook_active: stopHookActive, last_assistant_message: lastAssistantText ?? '' })
   }
-  sessionStart(source: 'startup' | 'resume' | 'compact' = 'startup'): Promise<PolicyDecision> {
-    return this.fire('SessionStart', undefined, { source })
+  sessionStart(source: 'startup' | 'resume' | 'clear' | 'compact' = 'startup'): Promise<PolicyDecision> {
+    return this.fire('SessionStart', undefined, { source }, source)
   }
 }
 

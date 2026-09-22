@@ -25,9 +25,98 @@ export function parsePermissionRule(raw: string): PermissionRule | null {
   return { tool: m[1], arg: m[2] ?? null }
 }
 
-/** Expand ${AGENT_DIR} / ${HOME} placeholders the profile templates use. */
-export function expandPlaceholders(raw: string, vars: { AGENT_DIR: string; HOME: string }): string {
-  return raw.replace(/\$\{AGENT_DIR\}/g, vars.AGENT_DIR).replace(/\$\{HOME\}/g, vars.HOME)
+export interface PlaceholderVars { AGENT_DIR: string; HOME: string; PROJECT_ROOT?: string }
+
+/** Expand ${AGENT_DIR} / ${HOME} / ${PROJECT_ROOT} placeholders the profile templates use. */
+export function expandPlaceholders(raw: string, vars: PlaceholderVars): string {
+  let out = raw.replace(/\$\{AGENT_DIR\}/g, vars.AGENT_DIR).replace(/\$\{HOME\}/g, vars.HOME)
+  if (vars.PROJECT_ROOT) out = out.replace(/\$\{PROJECT_ROOT\}/g, vars.PROJECT_ROOT)
+  return out
+}
+
+/**
+ * Split a shell command line into the simple commands a rule must see.
+ * Claude Code checks each part of `a && b`, `a | b`, `a; b`, and the bodies of
+ * `$( … )` / backticks; the first native-api version compared the WHOLE line,
+ * so `true && rm -rf x` walked past `Bash(rm:*)`. Quote-aware for '…' and "…"
+ * (separators inside quotes do not split). Leading `VAR=value` assignments are
+ * dropped from each part, as they do not change which program runs.
+ * Not a shell parser: heredocs, functions and eval stay out of reach, which is
+ * why these rules are a deny list and not a sandbox.
+ */
+export function splitShellCommand(cmd: string): string[] {
+  const parts: string[] = []
+  const subs: string[] = []
+  let cur = ''
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]
+    if (quote) {
+      if (c === quote) quote = null
+      else if (quote === '"' && c === '$' && cmd[i + 1] === '(') {
+        const end = matchParen(cmd, i + 1)
+        subs.push(cmd.slice(i + 2, end))
+      } else if (quote === '"' && c === '`') {
+        const end = cmd.indexOf('`', i + 1)
+        if (end > i) subs.push(cmd.slice(i + 1, end))
+      }
+      cur += c
+      continue
+    }
+    if (c === '"' || c === "'") { quote = c; cur += c; continue }
+    if (c === '\\' && i + 1 < cmd.length) { cur += c + cmd[++i]; continue }
+    if (c === '$' && cmd[i + 1] === '(') {
+      const end = matchParen(cmd, i + 1)
+      subs.push(cmd.slice(i + 2, end))
+      cur += cmd.slice(i, end + 1)
+      i = end
+      continue
+    }
+    if (c === '`') {
+      const end = cmd.indexOf('`', i + 1)
+      if (end > i) { subs.push(cmd.slice(i + 1, end)); cur += cmd.slice(i, end + 1); i = end; continue }
+    }
+    // Redirections that contain '&' (2>&1, &>file, <&3) are not separators.
+    if (c === '&' && (cmd[i - 1] === '>' || cmd[i - 1] === '<' || (cmd[i + 1] === '>' && cmd[i - 1] !== '&'))) { cur += c; continue }
+    if (c === ';' || c === '\n' || c === '|' || c === '&') {
+      parts.push(cur)
+      cur = ''
+      if ((c === '|' || c === '&') && cmd[i + 1] === c) i++
+      continue
+    }
+    if (c === '(' || c === ')' || c === '{' || c === '}') { cur += ' '; continue }
+    cur += c
+  }
+  parts.push(cur)
+  const out: string[] = []
+  for (const p of parts) {
+    const t = p.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S*)\s+)+/, '').trim()
+    if (t) out.push(t)
+  }
+  for (const s of subs) out.push(...splitShellCommand(s))
+  return out
+}
+
+function matchParen(s: string, open: number): number {
+  let depth = 0
+  for (let i = open; i < s.length; i++) {
+    if (s[i] === '(') depth++
+    else if (s[i] === ')') { depth--; if (depth === 0) return i }
+  }
+  return s.length
+}
+
+/** Claude Code Bash rule: "prefix:*" (legacy), a space-wildcard glob ("curl *https://*"), or exact. */
+export function bashRuleMatches(ruleArg: string, command: string): boolean {
+  if (ruleArg.endsWith(':*')) {
+    const prefix = ruleArg.slice(0, -2)
+    return command === prefix || command.startsWith(prefix + ' ')
+  }
+  if (ruleArg.includes('*')) {
+    const re = ruleArg.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')
+    return new RegExp(`^${re}$`, 's').test(command)
+  }
+  return command === ruleArg
 }
 
 /** Glob -> RegExp: `**` = any path segment(s), `*` = within a segment, `?` = one char. */
@@ -56,14 +145,7 @@ function toolNameMatches(pattern: string, tool: string): boolean {
 function argMatches(rule: PermissionRule, tool: string, arg: string | null): boolean {
   if (rule.arg === null || rule.arg === '*') return true
   if (arg === null) return false
-  if (tool === 'Bash') {
-    // "prefix:*" -> the command starts with prefix (word boundary); "exact" -> equal.
-    if (rule.arg.endsWith(':*')) {
-      const prefix = rule.arg.slice(0, -2)
-      return arg === prefix || arg.startsWith(prefix + ' ')
-    }
-    return arg === rule.arg
-  }
+  if (tool === 'Bash') return bashRuleMatches(rule.arg, arg)
   // Path-like tools: glob on the (absolute) argument.
   return globToRegExp(rule.arg).test(arg)
 }
@@ -77,7 +159,7 @@ export interface PermissionSet {
 export function buildPermissionSet(
   lists: { allow?: string[]; deny?: string[] } | null | undefined,
   permissionMode: 'permissive' | 'strict',
-  vars: { AGENT_DIR: string; HOME: string },
+  vars: PlaceholderVars,
 ): PermissionSet {
   const parse = (xs: string[] | undefined): PermissionRule[] =>
     (xs ?? []).map((x) => parsePermissionRule(expandPlaceholders(x, vars))).filter((r): r is PermissionRule => r !== null)
@@ -92,12 +174,34 @@ export type PermissionDecision = { allowed: true; rule?: PermissionRule } | { al
  * command line for Bash, the URL for WebFetch, null otherwise.
  */
 export function checkPermission(set: PermissionSet, tool: string, arg: string | null): PermissionDecision {
+  // A compound command is checked part by part: ANY part hitting a deny rule
+  // denies the line, and under 'strict' EVERY part must be allowed. The whole
+  // line is checked too, so a rule written against the full text still bites.
+  if (tool === 'Bash' && arg !== null) {
+    const parts = splitShellCommand(arg)
+    if (parts.length > 1 || (parts.length === 1 && parts[0] !== arg.trim())) {
+      for (const p of [arg, ...parts]) {
+        const d = checkSimple(set, tool, p, 'deny-only')
+        if (!d.allowed) return d
+      }
+      if (set.permissionMode === 'permissive') return { allowed: true }
+      for (const p of parts) {
+        const d = checkSimple(set, tool, p, 'full')
+        if (!d.allowed) return d
+      }
+      return { allowed: true }
+    }
+  }
+  return checkSimple(set, tool, arg, 'full')
+}
+
+function checkSimple(set: PermissionSet, tool: string, arg: string | null, mode: 'full' | 'deny-only'): PermissionDecision {
   for (const r of set.deny) {
     if (toolNameMatches(r.tool, tool) && argMatches(r, tool, arg)) {
       return { allowed: false, rule: r, reason: `denied by rule ${formatRule(r)}` }
     }
   }
-  if (set.permissionMode === 'permissive') return { allowed: true }
+  if (mode === 'deny-only' || set.permissionMode === 'permissive') return { allowed: true }
   for (const r of set.allow) {
     if (toolNameMatches(r.tool, tool) && argMatches(r, tool, arg)) return { allowed: true, rule: r }
   }

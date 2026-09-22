@@ -84,11 +84,39 @@ export function appendTranscript(path: string, entry: Record<string, unknown>): 
   }
 }
 
-/** Keep the stored history bounded: drop the oldest turns past `maxMessages`, never splitting a tool call from its result. */
-export function trimHistory(messages: ModelMessage[], maxMessages: number): ModelMessage[] {
-  if (messages.length <= maxMessages) return messages
-  let start = messages.length - maxMessages
-  // Never start on a tool-result message (its call would be missing).
-  while (start < messages.length && messages[start].role === 'tool') start++
-  return messages.slice(start)
+/** Rough size of a message in characters (content JSON), for the budget trim. */
+function messageChars(m: ModelMessage): number {
+  try { return JSON.stringify(m.content).length } catch { return 0 }
+}
+
+/**
+ * Keep the stored history bounded, by message count AND by size. The first
+ * version counted messages only, but one tool result may be 60k characters, so
+ * a long session could outgrow the model's context and fail every later turn
+ * while resume kept loading it. The cut always lands on a USER message: a
+ * history that opens on a tool result (its call gone) or an assistant turn is
+ * rejected by some providers (Gemini, and Anthropic for tool pairs).
+ * The newest user message is always kept, even when it alone exceeds the budget.
+ */
+export function trimHistory(messages: ModelMessage[], maxMessages: number, maxChars: number = Number.POSITIVE_INFINITY): ModelMessage[] {
+  let start = Math.max(0, messages.length - maxMessages)
+  let total = 0
+  for (let i = messages.length - 1; i >= start; i--) {
+    total += messageChars(messages[i])
+    if (total > maxChars) { start = i + 1; break }
+  }
+  while (start < messages.length && messages[start].role !== 'user') start++
+  if (start >= messages.length) {
+    // No user message inside the budget: keep from the last user message on.
+    for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === 'user') return messages.slice(i)
+    return []
+  }
+  return start === 0 ? messages : messages.slice(start)
+}
+
+/** Delete native-api sessions not touched for `maxAgeDays` (they are never resumed after that). */
+export function pruneRuntimeSessions(maxAgeDays = 30, nowSec: number = Math.floor(Date.now() / 1000)): number {
+  ensureRuntimeSessionsTable()
+  const cutoff = nowSec - maxAgeDays * 86400
+  return getDb().prepare('DELETE FROM runtime_sessions WHERE updated_at < ?').run(cutoff).changes
 }

@@ -8,7 +8,7 @@
 // runtime_sessions (provider-independent resume). The system prompt is the
 // rendered instructions (CLAUDE.md + SOUL.md) plus the skills index.
 
-import { generateText, stepCountIs, type ModelMessage, type ToolSet } from 'ai'
+import { generateText, stepCountIs, type LanguageModelUsage, type ModelMessage, type ToolSet } from 'ai'
 import { readFileSync, existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -19,9 +19,9 @@ import { buildPermissionSet } from '../permissions.js'
 import { PolicyEngine, transcriptPathFor } from '../policy/engine.js'
 import { renderInstructionsMd, type ClaudeHooksConfig, type McpServerDef } from '../bundle-render.js'
 import { modelFor, MissingApiKeyError } from './provider.js'
-import { builtinTools, readOnlyToolNames, type ToolContext } from './tools.js'
+import { builtinTools, readOnlyToolNames, resolveToolPath, type ToolContext } from './tools.js'
 import { connectMcpServer, mcpToolSet, closeAll, type McpConnection } from './mcp-client.js'
-import { loadSession, saveSession, newSessionId, appendTranscript, trimHistory } from './history.js'
+import { loadSession, saveSession, newSessionId, appendTranscript, trimHistory, pruneRuntimeSessions } from './history.js'
 import type {
   AgentHandle, AgentRuntime, AgentSpec, AgentState, HealthProbeResult, RunOptions, RunResult,
   RuntimeCapabilities, SendOptions, SendOutcome, ToolCallRecord, UsageCursor, UsageRecord,
@@ -63,8 +63,18 @@ export function systemPromptFor(spec: AgentSpec): string {
 interface Session { spec: AgentSpec; sessionId: string | null; chain: Promise<unknown>; inFlight: number; lastResult: RunResult | null; usage: UsageRecord[]; authFailed: boolean }
 const sessions = new Map<string, Session>()
 
+// runtime_sessions rows were never deleted; prune stale ones at most every 6 h.
+let lastPruneAt = 0
+function maybePruneSessions(now: number): void {
+  if (now - lastPruneAt < 6 * 3600_000) return
+  lastPruneAt = now
+  try { const n = pruneRuntimeSessions(30); if (n) logger.info({ pruned: n }, 'native-api: stale runtime sessions pruned') }
+  catch (err) { logger.debug({ err }, 'native-api: session prune failed') }
+}
+
 async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): Promise<RunResult> {
   const startedAt = Date.now()
+  maybePruneSessions(startedAt)
   const { getSecret } = await import('../../web/vault.js')
   const secretLookup = (id: string): string | null => { try { return getSecret(id) } catch { return null } }
   const cwd = opts.cwd ?? spec.dir
@@ -76,7 +86,11 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
   const settings = readJson<{ hooks?: ClaudeHooksConfig; permissions?: { allow?: string[]; deny?: string[] } }>(join(spec.dir, '.claude', 'settings.json'))
   const profile = readJson<{ permissionMode?: string }>(join(PROJECT_ROOT, 'templates', 'profiles', `${spec.securityProfile}.json`))
   const permissionMode: 'permissive' | 'strict' = profile?.permissionMode === 'strict' ? 'strict' : 'permissive'
-  const permissions = buildPermissionSet(settings?.permissions, permissionMode, { AGENT_DIR: spec.dir, HOME: homedir() })
+  // Placeholders expand to CANONICAL paths: the tools judge realpath'd
+  // arguments (resolveToolPath), so a symlinked agent dir must not make every
+  // allow rule miss.
+  const canon = (p: string) => resolveToolPath('/', p)
+  const permissions = buildPermissionSet(settings?.permissions, permissionMode, { AGENT_DIR: canon(spec.dir), HOME: canon(homedir()), PROJECT_ROOT: canon(PROJECT_ROOT) })
   const policy = new PolicyEngine(settings?.hooks, { sessionId, cwd, transcriptPath, repoRoot: PROJECT_ROOT })
 
   let model
@@ -103,28 +117,47 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
     if (conns.length) Object.assign(tools, await mcpToolSet(conns, toolCtx))
   }
 
+  // SessionStart runs FIRST (Claude Code order) and its context -- ledger/
+  // taskstate replay -- reaches the model; the first version fired it after
+  // the prompt hooks and threw the result away. A resumed session gets
+  // source=resume, so replay hooks keyed on it behave as on Claude.
+  const ss = await policy.sessionStart(prior ? 'resume' : 'startup')
   // UserPromptSubmit hooks: may block the prompt or inject context.
   const ups = await policy.userPromptSubmit(prompt)
   if (!ups.allowed) { await closeAll(conns); return { text: null, blocked: true, reason: `prompt blocked by hook: ${ups.reason}`, sessionRef: sessionId, toolCalls } }
-  if (!prior) await policy.sessionStart('startup')
-  const userText = ups.additionalContext.length ? `${ups.additionalContext.join('\n')}\n\n${prompt}` : prompt
+  const injected = [...ss.additionalContext, ...ups.additionalContext]
+  const userText = injected.length ? `${injected.join('\n')}\n\n${prompt}` : prompt
 
-  const messages: ModelMessage[] = [...(prior?.messages ?? []), { role: 'user', content: userText }]
+  let messages: ModelMessage[] = [...(prior?.messages ?? []), { role: 'user', content: userText }]
   appendTranscript(transcriptPath, { type: 'user', text: prompt })
   const ac = new AbortController()
   const timeoutMs = opts.timeoutMs ?? DEFAULT_NATIVE_TIMEOUT_MS
   const timer = setTimeout(() => ac.abort(), timeoutMs)
   let result
+  let stop: Awaited<ReturnType<PolicyEngine['stop']>> = { allowed: true, additionalContext: [], outcomes: [] }
+  const passUsages: LanguageModelUsage[] = []
   try {
-    result = await generateText({
-      model,
-      system: systemPromptFor(spec),
-      messages,
-      tools,
-      stopWhen: stepCountIs(MAX_STEPS),
-      abortSignal: ac.signal,
-      onStepFinish: (step) => { if (step.text) opts.onProgress?.(step.text) },
-    })
+    // Stop hooks follow Claude Code: a deny ("block") means the turn may NOT
+    // end yet -- the reason goes back to the model as feedback and it
+    // continues. One continuation, then stop_hook_active=true semantics: a
+    // second deny is reported in `reason`, never looped.
+    for (let pass = 0; pass < 2; pass++) {
+      result = await generateText({
+        model,
+        system: systemPromptFor(spec),
+        messages,
+        tools,
+        stopWhen: stepCountIs(MAX_STEPS),
+        abortSignal: ac.signal,
+        onStepFinish: (step) => { if (step.text) opts.onProgress?.(step.text) },
+      })
+      passUsages.push(result.usage)
+      const passText = result.text?.trim() ? result.text : null
+      stop = await policy.stop(passText, pass > 0)
+      if (stop.allowed || pass > 0) break
+      messages = [...messages, ...result.responseMessages, { role: 'user', content: `[stop-hook] ${stop.reason ?? 'the turn may not end yet'}` }]
+      appendTranscript(transcriptPath, { type: 'stop-hook', reason: stop.reason })
+    }
   } catch (err) {
     clearTimeout(timer); await closeAll(conns)
     const aborted = ac.signal.aborted
@@ -141,21 +174,22 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
   }
   clearTimeout(timer)
   await closeAll(conns)
+  if (!result) return { text: null, blocked: true, reason: 'no model result', sessionRef: sessionId, toolCalls }
 
   const text = result.text?.trim() ? result.text : null
-  // Stop hooks (e.g. telegram-reply-guard): a deny is reported, not looped -- the
-  // caller (Phase 5 bridge) re-prompts with the reason, mirroring Claude Code.
-  const stop = await policy.stop(text)
-  const u = result.usage
+  // Sum over both passes when a Stop hook asked for a continuation.
+  const sum = (f: (u: LanguageModelUsage) => number | undefined) => passUsages.reduce((a, u) => a + (f(u) ?? 0), 0)
   const usage: UsageRecord = {
-    inputTokens: u.inputTokens ?? 0,
-    outputTokens: u.outputTokens ?? 0,
-    cacheReadTokens: u.inputTokenDetails?.cacheReadTokens ?? 0,
-    cacheCreationTokens: u.inputTokenDetails?.cacheWriteTokens ?? 0,
-    thinkingTokens: u.outputTokenDetails?.reasoningTokens ?? 0,
+    inputTokens: sum((u) => u.inputTokens),
+    outputTokens: sum((u) => u.outputTokens),
+    cacheReadTokens: sum((u) => u.inputTokenDetails?.cacheReadTokens),
+    cacheCreationTokens: sum((u) => u.inputTokenDetails?.cacheWriteTokens),
+    thinkingTokens: sum((u) => u.outputTokenDetails?.reasoningTokens),
     model: spec.model, provider: spec.provider, runtime: 'native-api', timestamp: startedAt, sessionRef: sessionId,
   }
-  const history = trimHistory([...messages, ...result.responseMessages], MAX_HISTORY_MESSAGES)
+  // Size budget: ~half the context window in characters (≈ tokens × 2), so the
+  // next turn's prompt, system text and tool output still fit.
+  const history = trimHistory([...messages, ...result.responseMessages], MAX_HISTORY_MESSAGES, contextLimitForModel(spec.model) * 2)
   saveSession({ id: sessionId, agent: spec.id, runtime: 'native-api', provider: spec.provider, model: spec.model, messages: history, turns: (prior?.turns ?? 0) + 1, created_at: prior?.created_at })
   appendTranscript(transcriptPath, { type: 'assistant', text, finishReason: result.finishReason, steps: result.steps.length })
   try { const { recordRuntimeUsage } = await import('../usage-sink.js'); recordRuntimeUsage(spec.id, usage, { contentPreview: prompt.slice(0, 200) }) }
