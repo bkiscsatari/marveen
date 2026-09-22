@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { runJsonlCli, finalizeRunResult, timeoutApology, ResumeChainSessions } from '../runtime/cli-process.js'
-import { orphansToReap, liveChildren, type ChildEntry } from '../runtime/child-registry.js'
+import { orphansToReap, reapPlan, liveChildren, type ChildEntry } from '../runtime/child-registry.js'
 import type { AgentSpec, RunResult } from '../runtime/types.js'
 
 const tmp = mkdtempSync(join(tmpdir(), 'marveen-cli-'))
@@ -144,6 +144,13 @@ describe('orphan reaper selection', () => {
       e({ pid: 104, owner: 999 }),     // owner = this process -> keep
     ], 999, deps)
     expect(picked.map((x) => x.pid)).toEqual([100])
+  })
+
+  it('a group whose leader already exited is reaped through its surviving members -- only while young', () => {
+    const deps = { isAlive: (p: number) => p === 777, cmdline: () => null, groupMembers: (g: number) => (g === 200 ? [777] : []), now: 10_000_000 }
+    expect(reapPlan([e({ pid: 200, startedAt: 10_000_000 - 60_000 })], 999, deps)).toEqual([{ entry: expect.objectContaining({ pid: 200 }), how: 'members' }])
+    expect(reapPlan([e({ pid: 200, startedAt: 0 })], 999, deps)).toEqual([]) // too old: the pgid may be recycled
+    expect(reapPlan([e({ pid: 201, startedAt: 10_000_000 - 60_000 })], 999, deps)).toEqual([]) // no members left
   })
 })
 

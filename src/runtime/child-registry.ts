@@ -8,7 +8,7 @@
 // reapOrphanedChildren() terminates the groups a previous process left behind,
 // after checking that the pid still belongs to the same binary (pid reuse).
 
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { atomicWriteFileSync } from '../web/atomic-write.js'
 import { logger } from '../logger.js'
@@ -42,21 +42,64 @@ export function unregisterChild(pid: number | undefined): void {
 
 export function liveChildren(): ChildEntry[] { return [...live.values()] }
 
-/** Pure: which recorded children should be reaped now? */
-export function orphansToReap(entries: ChildEntry[], ownerPid: number, deps: { isAlive: (pid: number) => boolean; cmdline: (pid: number) => string | null }): ChildEntry[] {
-  return entries.filter((e) => {
-    if (!e || !Number.isInteger(e.pid) || e.pid <= 1) return false
-    if (e.owner === ownerPid) return false // ours, still tracked
-    if (deps.isAlive(e.owner)) return false // its dashboard is still running (another install/process)
-    if (!deps.isAlive(e.pid)) return false
-    const cmd = deps.cmdline(e.pid)
-    const base = e.bin.split('/').pop() ?? e.bin
-    return !!cmd && cmd.includes(base) // pid reuse guard
-  })
+// A group whose leader already exited can still hold members (a tool's
+// `sleep`, an MCP server). The leader's pid cannot vouch for them any more, so
+// they are reaped only while the entry is young enough that the pgid cannot
+// plausibly have been recycled by an unrelated group leader.
+export const MAX_ORPHAN_AGE_MS = 2 * 60 * 60 * 1000
+
+export type ReapAction = { entry: ChildEntry; how: 'leader' | 'members' }
+
+/** Pure: which recorded children (or their surviving groups) should be reaped now? */
+export function orphansToReap(
+  entries: ChildEntry[],
+  ownerPid: number,
+  deps: { isAlive: (pid: number) => boolean; cmdline: (pid: number) => string | null; groupMembers?: (pgid: number) => number[]; now?: number },
+): ChildEntry[] {
+  return reapPlan(entries, ownerPid, deps).map((a) => a.entry)
+}
+
+export function reapPlan(
+  entries: ChildEntry[],
+  ownerPid: number,
+  deps: { isAlive: (pid: number) => boolean; cmdline: (pid: number) => string | null; groupMembers?: (pgid: number) => number[]; now?: number },
+): ReapAction[] {
+  const out: ReapAction[] = []
+  const now = deps.now ?? Date.now()
+  for (const e of entries) {
+    if (!e || !Number.isInteger(e.pid) || e.pid <= 1) continue
+    if (e.owner === ownerPid) continue // ours, still tracked
+    if (deps.isAlive(e.owner)) continue // its dashboard is still running (another install/process)
+    if (deps.isAlive(e.pid)) {
+      const cmd = deps.cmdline(e.pid)
+      const base = e.bin.split('/').pop() ?? e.bin
+      if (cmd && cmd.includes(base)) out.push({ entry: e, how: 'leader' }) // pid reuse guard
+      continue
+    }
+    if (now - e.startedAt < MAX_ORPHAN_AGE_MS && (deps.groupMembers?.(e.pid) ?? []).length) out.push({ entry: e, how: 'members' })
+  }
+  return out
 }
 
 function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM' }
+}
+
+/** Live processes whose process group id is `pgid` (Linux /proc; empty elsewhere). */
+function procGroupMembers(pgid: number): number[] {
+  const out: number[] = []
+  let names: string[] = []
+  try { names = readdirSync('/proc') } catch { return out }
+  for (const n of names) {
+    if (!/^\d+$/.test(n)) continue
+    try {
+      const stat = readFileSync(`/proc/${n}/stat`, 'utf-8')
+      // pid (comm) state ppid pgrp ... -- comm may contain spaces/parens: parse after the last ')'
+      const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+      if (Number(rest[2]) === pgid) out.push(Number(n))
+    } catch { /* raced */ }
+  }
+  return out
 }
 
 function procCmdline(pid: number): string | null {
@@ -69,11 +112,12 @@ export function reapOrphanedChildren(storeDir: string): number {
   if (!existsSync(p)) return 0
   let entries: ChildEntry[] = []
   try { entries = JSON.parse(readFileSync(p, 'utf-8')) as ChildEntry[] } catch { entries = [] }
-  const victims = orphansToReap(Array.isArray(entries) ? entries : [], process.pid, { isAlive: pidAlive, cmdline: procCmdline })
-  for (const v of victims) {
-    try { process.kill(-v.pid, 'SIGTERM') } catch { try { process.kill(v.pid, 'SIGTERM') } catch { /* gone */ } }
+  const plan = reapPlan(Array.isArray(entries) ? entries : [], process.pid, { isAlive: pidAlive, cmdline: procCmdline, groupMembers: procGroupMembers })
+  const victims = plan.map((a) => a.entry)
+  for (const { entry: v, how } of plan) {
+    try { process.kill(-v.pid, 'SIGTERM') } catch { try { if (how === 'leader') process.kill(v.pid, 'SIGTERM') } catch { /* gone */ } }
     setTimeout(() => { try { process.kill(-v.pid, 'SIGKILL') } catch { /* gone */ } }, 5_000).unref()
-    logger.warn({ pid: v.pid, runtime: v.label, agent: v.agentId, startedAt: new Date(v.startedAt).toISOString() }, 'child-registry: reaped an orphaned runtime process group from a previous dashboard run')
+    logger.warn({ pid: v.pid, how, runtime: v.label, agent: v.agentId, startedAt: new Date(v.startedAt).toISOString() }, 'child-registry: reaped an orphaned runtime process group from a previous dashboard run')
   }
   // Start this process's registry clean.
   try { atomicWriteFileSync(p, JSON.stringify(liveChildren(), null, 2) + '\n') } catch { /* best effort */ }
