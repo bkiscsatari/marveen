@@ -60,7 +60,7 @@ describe('normalizeAuthMode -- accepts the legacy Claude-only vocabulary', () =>
 })
 
 describe('defaultRuntimeFor -- Phase 0 is behaviour-neutral for everything the Claude CLI could reach', () => {
-  it.each(['anthropic', 'deepseek', 'minimax', 'moonshot', 'zhipu', 'openrouter', 'ollama'] as const)(
+  it.each(['anthropic', 'deepseek', 'moonshot', 'zhipu', 'openrouter', 'ollama'] as const)(
     '%s stays on claude-tmux whatever the auth mode and role', (provider) => {
       expect(defaultRuntimeFor(provider, 'subscription', 'sub')).toBe('claude-tmux')
       expect(defaultRuntimeFor(provider, 'api', 'worker')).toBe('claude-tmux')

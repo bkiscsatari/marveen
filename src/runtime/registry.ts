@@ -26,6 +26,7 @@ const SHIP_PHASE: Record<RuntimeKind, string> = {
   'codex-cli': 'Phase 2',
   'gemini-cli': 'Phase 3',
   'native-api': 'Phase 4',
+  'minimax-cli': 'Phase 7',
 }
 
 type Loader = () => Promise<{ default: AgentRuntime } | { runtime: AgentRuntime }>
@@ -36,6 +37,7 @@ const BUILTIN_LOADERS: Partial<Record<RuntimeKind, Loader>> = {
   'codex-cli': () => import('./codex-cli.js'),
   'gemini-cli': () => import('./gemini-cli.js'),
   'native-api': () => import('./native-api/index.js'),
+  'minimax-cli': () => import('./minimax-cli.js'),
 }
 
 export function registerRuntime(rt: AgentRuntime): void {

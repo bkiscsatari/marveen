@@ -56,6 +56,8 @@ export const RUNTIME_PROVIDERS: Record<RuntimeKind, readonly ProviderKind[]> = {
   'codex-cli': ['openai'],
   'gemini-cli': ['google'],
   'native-api': ['anthropic', 'openai', 'google', 'deepseek', 'minimax', 'moonshot', 'zhipu', 'openrouter', 'ollama'],
+  // MiniMax Code (`mcode`): the vendor's own agent CLI, subscription login or API key.
+  'minimax-cli': ['minimax'],
 }
 
 export function runtimeSupportsProvider(runtime: RuntimeKind, provider: ProviderKind): boolean {
@@ -77,6 +79,10 @@ export function defaultRuntimeFor(provider: ProviderKind, authMode: AuthMode, _r
       return authMode === 'subscription' ? 'codex-cli' : 'native-api'
     case 'google':
       return authMode === 'subscription' ? 'gemini-cli' : 'native-api'
+    case 'minimax':
+      // api (the historical default for MiniMax) keeps the Claude-CLI Anthropic-compat
+      // path; a SUBSCRIPTION (mcode login, no API key) needs the vendor's own CLI.
+      return authMode === 'subscription' ? 'minimax-cli' : 'claude-tmux'
     default:
       return 'claude-tmux'
   }

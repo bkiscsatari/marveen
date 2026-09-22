@@ -21,6 +21,7 @@ export const RUNTIME_KINDS = [
   'codex-cli',
   'gemini-cli',
   'native-api',
+  'minimax-cli',
 ] as const
 export type RuntimeKind = (typeof RUNTIME_KINDS)[number]
 

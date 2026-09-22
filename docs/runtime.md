@@ -6,11 +6,11 @@
 
 | Tengely | Értékek | Hol állítod |
 |---|---|---|
-| **runtime** (ki futtatja az ügynök-loopot) | `claude-tmux` (a régi interaktív TUI tmux-ban), `claude-headless` (`claude -p` stream-json), `codex-cli` (OpenAI Codex CLI), `gemini-cli` (Google Gemini CLI), `native-api` (saját tool-loop az AI SDK-n) | `agents/<id>/agent-config.json` → `"runtime"`; hiányában `MARVEEN_DEFAULT_RUNTIME`, majd a provider szerinti alapértelmezés |
+| **runtime** (ki futtatja az ügynök-loopot) | `claude-tmux` (a régi interaktív TUI tmux-ban), `claude-headless` (`claude -p` stream-json), `codex-cli` (OpenAI Codex CLI), `gemini-cli` (Google Gemini CLI), `native-api` (saját tool-loop az AI SDK-n), `minimax-cli` (MiniMax Code `mcode`, előfizetéssel) | `agents/<id>/agent-config.json` → `"runtime"`; hiányában `MARVEEN_DEFAULT_RUNTIME`, majd a provider szerinti alapértelmezés |
 | **provider** (kié a modell) | `anthropic`, `openai`, `google`, `deepseek`, `minimax`, `openrouter`, `ollama`, `moonshot`, `zhipu` | `"provider"`; hiányában a modell-id prefixéből (`claude-`, `gpt-`, `gemini-`, `deepseek-`, `minimax-`, `kimi-`, `glm-`, `x/y` → openrouter, `x:tag` → ollama) |
 | **authMode** | `subscription` (CLI-login) / `api` (kulcs a vaultból) | `"authMode"`; a régi `shared`/`own_team` = subscription |
 
-Alapértelmezett runtime provider szerint (viselkedés-semleges): minden vendor, amit a Claude CLI Anthropic-kompatibilis endpointon elér (anthropic, deepseek, minimax, moonshot, zhipu, openrouter, ollama) → `claude-tmux`; `openai` → `codex-cli` (subscription) / `native-api` (api); `google` → `gemini-cli` / `native-api`.
+Alapértelmezett runtime provider szerint (viselkedés-semleges): minden vendor, amit a Claude CLI Anthropic-kompatibilis endpointon elér (anthropic, deepseek, minimax, moonshot, zhipu, openrouter, ollama) → `claude-tmux`; `openai` → `codex-cli` (subscription) / `native-api` (api); `google` → `gemini-cli` / `native-api`; `minimax` → `minimax-cli` (subscription) / `claude-tmux` (api, a mai Anthropic-kompatibilis út).
 
 Példa `agent-config.json`:
 
@@ -26,6 +26,7 @@ Példa `agent-config.json`:
 | claude-tmux / claude-headless | fleet OAuth token (`CLAUDE_CODE_OAUTH_TOKEN` a `.env`-ben, vagy `store/.claude-oauth-token`) | `ANTHROPIC_API_KEY` vault-id, per-agent: `agent-<id>-api-key` |
 | codex-cli | `codex login --device-auth` → `~/.codex/auth.json` (az adapter belinkeli minden agent `.codex/`-ába) | `OPENAI_API_KEY` vault-id → `CODEX_API_KEY` env a futásnak |
 | gemini-cli | `NO_BROWSER=true gemini` → `~/.gemini/oauth_creds.json` | `GEMINI_API_KEY` vault-id |
+| minimax-cli | `mcode login --region global --no-browser` (eszköz-kódos flow) → `~/.minimax` | `MINIMAX_API_KEY` vault-id (vagy `mcode provider set-minimax-key`) |
 | native-api | — | providerenként: `DEEPSEEK_API_KEY`, `MINIMAX_API_KEY`, `openrouter-fleet-key`, `MOONSHOT_API_KEY`, `ZHIPU_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`; Ollama-hoz semmi |
 
 Kanonikus új vault-idk: `provider:<provider>:api-key`, `agent:<id>:api-key` — a régi idk aliasként ELSŐ helyen maradnak, nincs migráció.
@@ -49,6 +50,7 @@ A 29 hook-script (`scripts/hooks/`) változatlan. Ki futtatja:
 - **claude-***: natívan (`.claude/settings.json`).
 - **codex-cli**: natívan, `.codex/hooks.json` (a `bundle-render` generálja) + `scripts/hooks/shim/codex-hook.mjs` (tool-név alias, exit-kód/JSON továbbítás).
 - **gemini-cli**: natívan, `.gemini/settings.json` `hooks` + `scripts/hooks/shim/gemini-hook.mjs` (esemény- és tool-név fordítás oda-vissza).
+- **minimax-cli**: natívan, Claude-formátumú plugin (`~/.minimax/plugins/marveen-hooks-<agent>/.claude-plugin/plugin.json` + `hooks/hooks.json`, a settings.json hookjai változatlanul), `mcode plugin add … -m local`.
 - **native-api**: in-process `PolicyEngine` (`src/runtime/policy/engine.ts`) minden tool-hívás előtt/után + `permissions.ts` (a Claude engedély-szintaxis kiértékelése).
 
 A `docs/runtime-parity.md` írja le a paritás-tesztet.
@@ -80,4 +82,8 @@ npx tsx scripts/smoke-gemini-cli.ts           # Gemini (login nélkül a hibaút
 npx tsx scripts/smoke-native-api.ts           # natív loop lokális Ollamán
 MARVEEN_RUNTIME_DUMP_DIR=/tmp/dump npx tsx scripts/smoke-claude-headless.ts   # fixture-rögzítés
 npm run morning:runtime                       # reggeli briefing bármely runtime-on
+```
+
+```bash
+npx tsx scripts/smoke-minimax-cli.ts            # MiniMax Code (login nélkül a hibaút)
 ```

@@ -14,7 +14,8 @@ case "$KIND" in
   claude) SMOKE=scripts/smoke-claude-headless.ts; DIR=src/__tests__/fixtures/claude-headless; PREFIX=claude-headless;;
   codex)  SMOKE=scripts/smoke-codex-cli.ts;       DIR=src/__tests__/fixtures/codex-cli;       PREFIX=codex-cli;;
   gemini) SMOKE=scripts/smoke-gemini-cli.ts;      DIR=src/__tests__/fixtures/gemini-cli;      PREFIX=gemini-cli;;
-  *) echo "usage: $0 claude|codex|gemini" >&2; exit 2;;
+  minimax) SMOKE=scripts/smoke-minimax-cli.ts;   DIR=src/__tests__/fixtures/minimax-cli;     PREFIX=minimax-cli;;
+  *) echo "usage: $0 claude|codex|gemini|minimax" >&2; exit 2;;
 esac
 DUMP="$(mktemp -d)"
 trap 'rm -rf "$DUMP"' EXIT
