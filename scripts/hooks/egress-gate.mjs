@@ -212,11 +212,104 @@ function isPrivateIPv6(host) {
   return false
 }
 
-// KNOWN LIMIT, stated rather than papered over: this checks the hostname as
-// written. A public name that RESOLVES to a private address (DNS rebinding)
-// still passes, because the hook sees the URL, not the socket. Closing that
-// needs resolution at fetch time, which is not this layer's job.
-export function isQuarantineDenied(url) {
+// HARDENING (2026-09-22, restored from the pre-v1.39 local gate, 059cb55).
+// The upstream rules above read the hostname AS WRITTEN, and three shapes walked
+// past them while resolving inward: a trailing dot ("localhost." is not in the
+// set and does not end in ".localhost"), wildcard-DNS names that encode the
+// address in a label (127.0.0.1.nip.io, app-7f000001.nip.io), and any public
+// name with an A record of 127.0.0.1 (localtest.me). The functions below close
+// the first two by name; the third is closed by resolvesInward() in the hook's
+// main block. The exfiltration-sink list is hygiene on top: the reader holds no
+// secret itself, but a caller talked into putting one in a URL should not find
+// a paste bin or a webhook catcher on the other end.
+
+// ONE normaliser for every reader check: lowercase, trailing dots off. The
+// first local version normalised in one check and compared the raw name in
+// another, so "pastebin.com." passed both.
+export function normalizeHost(hostname) {
+  return String(hostname ?? '').trim().toLowerCase().replace(/\.+$/, '')
+}
+
+// Loopback, "this network", RFC1918, CGNAT, link-local (metadata), broadcast.
+export function isInwardIPv4(a, b, c, d) {
+  const n = [a, b, c, d].map((x) => Number(x))
+  if (n.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false
+  if (n[0] === 127 || n[0] === 10 || n[0] === 0) return true
+  if (n[0] === 192 && n[1] === 168) return true
+  if (n[0] === 169 && n[1] === 254) return true
+  if (n[0] === 172 && n[1] >= 16 && n[1] <= 31) return true
+  if (n[0] === 100 && n[1] >= 64 && n[1] <= 127) return true
+  if (n[0] === 255 && n[1] === 255 && n[2] === 255 && n[3] === 255) return true
+  return false
+}
+
+// A DNS label can encode an address: 7f000001.nip.io, app-127-0-0-1.nip.io,
+// 100-64-0-1.nip.io, a decimal 2130706433. Measured against the wildcard-DNS
+// services on 2026-09-18 (see 059cb55 for the full notes).
+export function labelEncodesInwardAddress(label) {
+  const l = String(label ?? '').toLowerCase()
+  if (!l) return false
+  for (const m of l.matchAll(/(?:^|-)([0-9a-f]{8})(?=-|$)/g)) {
+    const v = parseInt(m[1], 16)
+    if (Number.isInteger(v) && isInwardIPv4((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255)) return true
+  }
+  const nums = [...l.matchAll(/\d{1,3}/g)]
+  for (let i = 0; i + 3 < nums.length; i++) {
+    const [a, b, c, d] = nums.slice(i, i + 4).map((m) => m[0])
+    const from = nums[i].index ?? 0
+    const to = (nums[i + 3].index ?? 0) + nums[i + 3][0].length
+    if (!/^[\d-]+$/.test(l.slice(from, to))) continue
+    if (isInwardIPv4(a, b, c, d)) return true
+  }
+  // Decimal 32-bit form; a leading zero is excluded ("08080808" is hex 8.8.8.8).
+  if (/^[1-9]\d{7,9}$/.test(l)) {
+    const v = Number(l)
+    if (Number.isInteger(v) && v >= 0 && v <= 4294967295) {
+      if (isInwardIPv4((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255)) return true
+    }
+  }
+  return false
+}
+
+// Does the NAME (not its A record) point inward? Applied to host names only;
+// IP literals are left to the upstream isPrivateIPv4/IPv6 rules above.
+export function nameLooksInward(hostname) {
+  const host = normalizeHost(hostname)
+  if (!host) return true
+  if (host.startsWith('[') || host.includes(':')) return false // IPv6 literal: upstream rules decide
+  if (/^\d+(\.\d+)*$/.test(host)) return false // IPv4 literal: upstream rules decide
+  const labels = host.split('.')
+  if (labels.length < 2) return true // single label: localhost and friends
+  const INTERNAL_TLD = ['local', 'internal', 'localdomain', 'lan', 'intranet', 'home', 'arpa', 'test',
+    'invalid', 'localhost', 'svc', 'cluster', 'corp', 'priv', 'private', 'domain']
+  if (INTERNAL_TLD.includes(labels[labels.length - 1])) return true
+  if (labels.some((l) => labelEncodesInwardAddress(l))) return true
+  for (let i = 0; i + 3 < labels.length; i++) {
+    if (isInwardIPv4(labels[i], labels[i + 1], labels[i + 2], labels[i + 3])) return true
+  }
+  return false
+}
+
+// Exfiltration sinks: a GET to one of these carries whatever is in the URL out
+// of the house. Baked in so an operator editing the JSON cannot lose it;
+// `quarantine_denylist` in store/egress-allowlist.json adds, never subtracts.
+export const QUARANTINE_EXFIL_DENY = [
+  'pastebin.com', 'paste.ee', 'hastebin.com', 'ghostbin.com', 'termbin.com', '0x0.st', 'dpaste.org', 'rentry.co',
+  'webhook.site', 'requestbin.com', 'pipedream.net', 'requestcatcher.com', 'beeceptor.com',
+  'ngrok.io', 'ngrok-free.app', 'loca.lt', 'serveo.net', 'trycloudflare.com',
+  'bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'is.gd', 'cutt.ly', 'rb.gy', 'shorturl.at',
+  'transfer.sh', 'file.io', 'anonfiles.com', 'gofile.io', 'catbox.moe', 'tmpfiles.org',
+  'api.telegram.org', 'discord.com', 'discordapp.com', 'discord.gg', 'slack.com',
+  'script.google.com', 'docs.google.com', 'forms.gle', 'google-analytics.com', 'analytics.google.com',
+  'smee.io', 'postb.in', 'typedwebhook.tools', 'ngrok.app', 'ngrok.dev', 'localtunnel.me',
+  'nip.io', 'sslip.io', 'traefik.me', 'localtest.me', 'lvh.me', 'vcap.me',
+]
+
+// The reader posture denies by NAME here; what a name RESOLVES to is checked by
+// resolvesInward() in the hook's main block (async, fail-closed), because a
+// pure function cannot see an A record. A DNS rebind between the gate's lookup
+// and the fetch's own lookup remains out of reach -- stated, not hidden.
+export function isQuarantineDenied(url, extraDeny = []) {
   let parsed
   try {
     parsed = new URL(url)
@@ -224,13 +317,54 @@ export function isQuarantineDenied(url) {
     return true // unparseable -> deny
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return true
-  const host = parsed.hostname.toLowerCase()
+  const host = normalizeHost(parsed.hostname)
   if (!host) return true
   if (QUARANTINE_DENY_HOSTS.has(host)) return true
-  if (QUARANTINE_DENY_SUFFIXES.some((s) => host.endsWith(s))) return true
+  if (QUARANTINE_DENY_SUFFIXES.some((s) => host === s.slice(1) || host.endsWith(s))) return true
   if (isPrivateIPv4(host)) return true
   if (isPrivateIPv6(host)) return true
+  if (nameLooksInward(host)) return true
+  if (parsed.port && parsed.port !== '80' && parsed.port !== '443') return true
+  const deny = [...QUARANTINE_EXFIL_DENY, ...(Array.isArray(extraDeny) ? extraDeny : []).filter((d) => typeof d === 'string')]
+  for (const d of deny) {
+    const entry = normalizeHost(d)
+    if (entry && (host === entry || host.endsWith('.' + entry))) return true
+  }
   return false
+}
+
+// Does this name RESOLVE inward? FAIL-CLOSED on lookup failure: a blocked
+// legitimate fetch is visible and retryable; an allowed inward one is not.
+export async function resolvesInward(hostname, lookupImpl) {
+  const host = normalizeHost(hostname).replace(/^\[|\]$/g, '')
+  const lookup = lookupImpl ?? (await import('node:dns/promises')).lookup
+  let addrs
+  try {
+    addrs = await lookup(host, { all: true, verbatim: true })
+  } catch {
+    return { inward: true, reason: 'dns lookup failed' }
+  }
+  for (const { address, family } of addrs) {
+    if (family === 4) {
+      const p = String(address).split('.')
+      if (isInwardIPv4(p[0], p[1], p[2], p[3])) return { inward: true, reason: `resolves inward (${address})` }
+    } else {
+      const a = String(address).toLowerCase()
+      const mapped = /^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(a)
+      if (mapped && isInwardIPv4(mapped[1], mapped[2], mapped[3], mapped[4])) {
+        return { inward: true, reason: `resolves inward (${address})` }
+      }
+      const embedded = /^(?:64:ff9b::|2002:)([0-9a-f]{1,4}):([0-9a-f]{1,4})/.exec(a)
+      if (embedded) {
+        const hi = parseInt(embedded[1], 16), lo = parseInt(embedded[2], 16)
+        if (isInwardIPv4((hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255)) {
+          return { inward: true, reason: `resolves inward (${address})` }
+        }
+      }
+      if (isPrivateIPv6(a)) return { inward: true, reason: `resolves inward (${address})` }
+    }
+  }
+  return { inward: false, reason: '' }
 }
 
 function matchesQuarantineDomain(url, extraDomains = []) {
@@ -272,10 +406,14 @@ export function loadRuntimeAllowlist() {
       // the reader; any other value -- absent key, typo, wrong type -- is the
       // allowlist default. Fail-closed to the louder failure direction.
       quarantinePosture: parsed.quarantine_reader_posture === 'denylist' ? 'denylist' : 'allowlist',
+      // Additive reader denylist (never subtracts from QUARANTINE_EXFIL_DENY).
+      quarantineDenylist: Array.isArray(parsed.quarantine_denylist)
+        ? parsed.quarantine_denylist.filter((d) => typeof d === 'string')
+        : [],
     }
   } catch {
     // Missing file or JSON parse error: treat as empty, never propagate.
-    return { domains: [], prefixes: [], quarantineDomains: [], quarantinePosture: 'allowlist' }
+    return { domains: [], prefixes: [], quarantineDomains: [], quarantinePosture: 'allowlist', quarantineDenylist: [] }
   }
 }
 
@@ -315,7 +453,7 @@ export function egressDecision(
   //    the one address the deny rules exist to refuse. An allowlist that
   //    predates the switch must not be able to re-open what the open posture
   //    walls off.
-  if (openReader && isQuarantineDenied(url)) {
+  if (openReader && isQuarantineDenied(url, runtimeList.quarantineDenylist ?? [])) {
     return { blocked: true, tier: 'quarantine-denied' }
   }
 
@@ -361,7 +499,7 @@ export function egressDecision(
       return { blocked: false, tier: 'quarantine' }
     }
     if (openReader) {
-      if (!isQuarantineDenied(url)) return { blocked: false, tier: 'quarantine-open' }
+      if (!isQuarantineDenied(url, runtimeList.quarantineDenylist ?? [])) return { blocked: false, tier: 'quarantine-open' }
       return { blocked: true, tier: 'quarantine-denied' }
     }
   }
@@ -462,25 +600,57 @@ function isInvokedDirectly() {
 }
 
 if (isInvokedDirectly()) {
-  let payload
-  try {
-    payload = JSON.parse(readFileSync(0, 'utf-8'))
-  } catch {
-    allow() // malformed/empty input must never block the agent
-  }
-  const url = String(payload?.tool_input?.url ?? '')
-  const agentType = String(payload?.agent_type ?? '')
-  const runtimeList = loadRuntimeAllowlist()
-  const decision = egressDecision(payload?.tool_name, payload?.tool_input, runtimeList, agentType)
-  if (decision.blocked) {
-    logLine('BLOCKED', url, 'reason="not on egress allowlist"', payloadKeySignature(payload), agentType)
-    deny(BLOCK_MESSAGE)
-  }
-  // Audited, not silent: the quarantine tier is the one grant a main agent
-  // cannot obtain, so every use of it leaves a line next to the denials. The
-  // other tiers are the ordinary allowlist and stay quiet.
-  if (decision.tier === 'quarantine') {
-    logLine('ALLOWED_QUARANTINE', url, 'reason="quarantine-reader tier"', '', agentType)
-  }
-  allow()
+  // Async because the open reader resolves DNS before allowing (resolvesInward).
+  // Any throw inside must still end in a DECISION: a denial on the open-reader
+  // path (it has no curated list behind it), an allow elsewhere (the main agent
+  // keeps its built-in list, and a hook crash must not break its ordinary work).
+  let readerOpenPath = false
+  await (async () => {
+    let payload
+    try {
+      payload = JSON.parse(readFileSync(0, 'utf-8'))
+    } catch {
+      allow() // malformed/empty input must never block the agent
+    }
+    const url = String(payload?.tool_input?.url ?? '')
+    const agentType = String(payload?.agent_type ?? '')
+    const runtimeList = loadRuntimeAllowlist()
+    readerOpenPath = agentType === QUARANTINE_AGENT_TYPE && runtimeList.quarantinePosture === 'denylist'
+    const decision = egressDecision(payload?.tool_name, payload?.tool_input, runtimeList, agentType)
+    if (decision.blocked) {
+      const reason = decision.tier === 'quarantine-denied'
+        ? 'reason="open reader posture refused: internal, non-standard port or exfiltration sink"'
+        : 'reason="not on egress allowlist"'
+      logLine('BLOCKED', url, reason, payloadKeySignature(payload), agentType)
+      deny(BLOCK_MESSAGE)
+    }
+    // The resolved-address check is HOST-scoped, not tier-scoped: while the
+    // reader runs open, EVERY allowing tier goes through it, so a listed name
+    // that resolves inward is as unreachable as an unlisted one.
+    if (readerOpenPath && url && decision.tier !== 'not-webfetch' && decision.tier !== 'no-url') {
+      let host = ''
+      try { host = new URL(url).hostname } catch { host = '' }
+      const verdict = host ? await resolvesInward(host) : { inward: true, reason: 'unparseable host' }
+      if (verdict.inward) {
+        logLine('BLOCKED', url, `reason="reader refused: ${verdict.reason}"`, payloadKeySignature(payload), agentType)
+        deny('Egress TILTOTT: a cel neve publikus, de BELSO cimre mutat (' + verdict.reason + '). ' +
+          'A karanten-olvaso nem erhet el loopback, maganhalozati vagy metaadat-cimet. Rogzitve a store/egress-blocked.log fajlban.')
+      }
+    }
+    // Audited, not silent: the quarantine tier is the one grant a main agent
+    // cannot obtain, so every use of it leaves a line next to the denials.
+    if (decision.tier === 'quarantine') {
+      logLine('ALLOWED_QUARANTINE', url, 'reason="quarantine-reader tier"', '', agentType)
+    }
+    // Open posture replaces per-domain approval with per-fetch AUDIT.
+    if (decision.tier === 'quarantine-open') {
+      logLine('ALLOWED_QUARANTINE_OPEN', url, 'reason="open reader posture"', '', agentType)
+    }
+    allow()
+  })().catch(() => {
+    if (readerOpenPath) {
+      deny('Egress TILTOTT: a kapu nem tudott dontest hozni (belso hiba), nyitott olvaso-posture-ben ez elutasitas.')
+    }
+    allow()
+  })
 }
