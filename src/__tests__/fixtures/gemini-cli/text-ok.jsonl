@@ -1,0 +1,7 @@
+{"type":"init","timestamp":"2026-09-22T06:00:00.000Z","session_id":"6f2c1a1e-1111-4222-8333-444455556666","model":"gemini-2.5-flash"}
+{"type":"message","timestamp":"2026-09-22T06:00:00.100Z","role":"user","content":"Read ./secret-number.txt and reply with only its content."}
+{"type":"tool_use","timestamp":"2026-09-22T06:00:01.000Z","tool_name":"read_file","tool_id":"call_1","parameters":{"absolute_path":"/tmp/x/secret-number.txt"}}
+{"type":"tool_result","timestamp":"2026-09-22T06:00:01.200Z","tool_id":"call_1","status":"success","output":"marveen-probe-42"}
+{"type":"message","timestamp":"2026-09-22T06:00:02.000Z","role":"assistant","content":"marveen-","delta":true}
+{"type":"message","timestamp":"2026-09-22T06:00:02.050Z","role":"assistant","content":"probe-42","delta":true}
+{"type":"result","timestamp":"2026-09-22T06:00:02.100Z","status":"success","stats":{"total_tokens":1234,"input_tokens":1100,"output_tokens":134,"cached":900,"input":200,"duration_ms":2100,"tool_calls":1,"models":{"gemini-2.5-flash":{"total_tokens":1234,"input_tokens":1100,"output_tokens":134,"cached":900}}}}

@@ -209,3 +209,88 @@ export function translateMatcher(matcher: string, alias: Record<string, string>)
   })
   return [...new Set(parts)].join('|')
 }
+
+// --- Gemini CLI: .gemini/settings.json (mcpServers + hooks) ------------------------
+//
+// Docs (geminicli.com/docs/hooks/, /docs/tools/mcp-server/, verified 2026-09-22):
+//   "hooks": { "BeforeTool": [ { "matcher": "write_file|replace", "hooks": [ { "name", "type": "command", "command", "timeout": <ms> } ] } ] }
+//   "mcpServers": { name: { command, args, env, cwd, url (SSE), httpUrl (streamable HTTP), headers } }
+
+/** Claude Code hook events -> Gemini CLI hook events (null = no equivalent). */
+export const CLAUDE_TO_GEMINI_EVENT: Record<string, string | null> = {
+  PreToolUse: 'BeforeTool',
+  PostToolUse: 'AfterTool',
+  UserPromptSubmit: 'BeforeAgent',
+  Stop: 'AfterAgent',
+  SessionStart: 'SessionStart',
+  SessionEnd: 'SessionEnd',
+  PreCompact: 'PreCompress',
+  Notification: 'Notification',
+  SubagentStop: null,
+}
+
+/** Claude Code tool names (matchers) -> Gemini CLI built-in tool names. */
+export const CLAUDE_TO_GEMINI_TOOL: Record<string, string> = {
+  Bash: 'run_shell_command',
+  Write: 'write_file',
+  Edit: 'replace',
+  MultiEdit: 'replace',
+  NotebookEdit: 'write_file',
+  Read: 'read_file',
+  WebFetch: 'web_fetch',
+  WebSearch: 'google_web_search',
+  Glob: 'glob',
+  Grep: 'grep_search',
+}
+
+export interface GeminiHookEntry { name: string; type: 'command'; command: string; timeout?: number }
+export interface GeminiHookGroup { matcher?: string; hooks: GeminiHookEntry[] }
+export interface GeminiSettings {
+  mcpServers?: Record<string, Record<string, unknown>>
+  hooks?: Record<string, GeminiHookGroup[]>
+  [k: string]: unknown
+}
+
+export function renderGeminiSettings(i: {
+  mcpServers: Record<string, McpServerDef>
+  claudeHooks: ClaudeHooksConfig | null | undefined
+  shimCommand: string
+  extra?: Record<string, unknown>
+}): { settings: GeminiSettings; skipped: string[] } {
+  const mcpServers: Record<string, Record<string, unknown>> = {}
+  for (const [name, def] of Object.entries(i.mcpServers)) {
+    if (def.url) {
+      // Marveen's own servers are streamable HTTP; SSE servers keep `url`.
+      const isSse = def.type === 'sse'
+      mcpServers[name] = { ...(isSse ? { url: def.url } : { httpUrl: def.url }), ...(def.headers ? { headers: def.headers } : {}) }
+    } else if (def.command) {
+      mcpServers[name] = { command: def.command, ...(def.args ? { args: def.args } : {}), ...(def.env ? { env: def.env } : {}) }
+    }
+  }
+  const hooks: Record<string, GeminiHookGroup[]> = {}
+  const skipped: string[] = []
+  let n = 0
+  for (const [event, groups] of Object.entries(i.claudeHooks ?? {})) {
+    const target = CLAUDE_TO_GEMINI_EVENT[event]
+    if (target === undefined) { skipped.push(`${event}: unknown Claude event`); continue }
+    if (target === null) { skipped.push(`${event}: no Gemini equivalent`); continue }
+    for (const g of groups ?? []) {
+      const entries: GeminiHookEntry[] = []
+      for (const h of g.hooks ?? []) {
+        if (h.type !== 'command' || !h.command) { skipped.push(`${event}: ${h.type ?? 'unknown'}-type hook has no command equivalent`); continue }
+        const b64 = Buffer.from(h.command, 'utf-8').toString('base64')
+        // Gemini timeouts are milliseconds (Claude's are seconds); the original
+        // Claude event name rides along so the shim can translate the payload.
+        entries.push({ name: `marveen-${event.toLowerCase()}-${++n}`, type: 'command', command: `${i.shimCommand} ${event} b64:${b64}`, ...(h.timeout ? { timeout: h.timeout * 1000 } : {}) })
+      }
+      if (!entries.length) continue
+      const group: GeminiHookGroup = { hooks: entries }
+      if (g.matcher) group.matcher = translateMatcher(g.matcher, CLAUDE_TO_GEMINI_TOOL)
+      ;(hooks[target] ??= []).push(group)
+    }
+  }
+  const settings: GeminiSettings = { ...(i.extra ?? {}) }
+  if (Object.keys(mcpServers).length) settings.mcpServers = mcpServers
+  if (Object.keys(hooks).length) settings.hooks = hooks
+  return { settings, skipped }
+}
