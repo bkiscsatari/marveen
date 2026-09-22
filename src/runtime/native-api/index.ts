@@ -22,6 +22,7 @@ import { modelFor, MissingApiKeyError } from './provider.js'
 import { builtinTools, readOnlyToolNames, resolveToolPath, type ToolContext } from './tools.js'
 import { connectMcpServer, mcpToolSet, closeAll, type McpConnection } from './mcp-client.js'
 import { loadSession, saveSession, newSessionId, appendTranscript, trimHistory, pruneRuntimeSessions } from './history.js'
+import { noteRunOutcome } from '../quota-state.js'
 import type {
   AgentHandle, AgentRuntime, AgentSpec, AgentState, HealthProbeResult, RunOptions, RunResult,
   RuntimeCapabilities, SendOptions, SendOutcome, ToolCallRecord, UsageCursor, UsageRecord,
@@ -170,7 +171,9 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
     }
     const auth = /401|403|unauthorized|invalid.*api key|authentication/i.test(msg)
     logger.warn({ agent: spec.id, err: msg.slice(0, 300), auth }, 'native-api: generateText failed')
-    return { text: null, blocked: true, reason: `${auth ? 'auth: ' : ''}${msg.slice(0, 500)}`, sessionRef: sessionId, toolCalls }
+    const failed: RunResult = { text: null, blocked: true, reason: `${auth ? 'auth: ' : ''}${msg.slice(0, 500)}`, sessionRef: sessionId, toolCalls }
+    noteRunOutcome('native-api', spec.provider, failed)
+    return failed
   }
   clearTimeout(timer)
   await closeAll(conns)
@@ -192,6 +195,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
   const history = trimHistory([...messages, ...result.responseMessages], MAX_HISTORY_MESSAGES, contextLimitForModel(spec.model) * 2)
   saveSession({ id: sessionId, agent: spec.id, runtime: 'native-api', provider: spec.provider, model: spec.model, messages: history, turns: (prior?.turns ?? 0) + 1, created_at: prior?.created_at })
   appendTranscript(transcriptPath, { type: 'assistant', text, finishReason: result.finishReason, steps: result.steps.length })
+  noteRunOutcome('native-api', spec.provider, { blocked: false })
   try { const { recordRuntimeUsage } = await import('../usage-sink.js'); recordRuntimeUsage(spec.id, usage, { contentPreview: prompt.slice(0, 200) }) }
   catch (err) { logger.debug({ err }, 'native-api: usage sink unavailable (skipped)') }
   return {

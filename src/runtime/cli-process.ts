@@ -23,6 +23,7 @@ import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { logger } from '../logger.js'
 import { registerChild, unregisterChild } from './child-registry.js'
+import { noteRunOutcome } from './quota-state.js'
 import type { AgentHandle, AgentSpec, AgentState, RunOptions, RunResult, RuntimeKind, SendOptions, SendOutcome, UsageCursor, UsageRecord } from './types.js'
 
 export const KILL_GRACE_MS = 5_000
@@ -140,7 +141,9 @@ export function finalizeRunResult(result: RunResult, out: JsonlCliOutcome, opts:
 }
 
 /** Usage is recorded whenever the stream reported it -- a blocked run still spent tokens. */
-export async function recordUsageBestEffort(agentId: string, result: RunResult, prompt: string, label: string): Promise<void> {
+export async function recordUsageBestEffort(agentId: string, result: RunResult, prompt: string, label: string, provider?: string): Promise<void> {
+  // Rate-limit memory for the router's target availability (quota-state.ts).
+  noteRunOutcome(label, provider ?? result.usage?.provider ?? '*', result)
   if (!result.usage) return
   try {
     const { recordRuntimeUsage } = await import('./usage-sink.js')

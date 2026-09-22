@@ -11,10 +11,9 @@
 // Cached for 60 s: the dropdown is rebuilt on every agent open, and `command
 // -v` per CLI per open is wasteful.
 
-import { execFileSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, accessSync, constants } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, delimiter } from 'node:path'
 import type { AuthMode, ProviderKind, RuntimeKind } from '../runtime/types.js'
 
 export interface SubscriptionModelEntry {
@@ -40,13 +39,15 @@ export interface SubscriptionRuntimeAvailability {
 const CACHE_MS = 60_000
 let cached: SubscriptionRuntimeAvailability | null = null
 
-function binaryOnPath(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  try {
-    const out = execFileSync('sh', ['-c', `command -v ${name}`], { encoding: 'utf-8', timeout: 3000, env, stdio: ['ignore', 'pipe', 'ignore'] })
-    return out.trim().length > 0
-  } catch {
-    return false
+// A PATH scan in-process: the first version ran `sh -c "command -v …"` three
+// times with execFileSync on the request path, blocking the event loop for up
+// to 9 s once a minute.
+export function binaryOnPath(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  for (const dir of (env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue
+    try { accessSync(join(dir, name), constants.X_OK); return true } catch { /* next */ }
   }
+  return false
 }
 
 /** Pure part: build the entry list from the three presence facts. */

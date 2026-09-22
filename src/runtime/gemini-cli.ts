@@ -161,7 +161,7 @@ async function runOnceLocked(spec: AgentSpec, prompt: string, opts: RunOptions &
   const result = finalizeRunResult(geminiSummaryToRunResult(summary, { runtime: 'gemini-cli', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode: out.exitCode, stderrTail: out.stderrTail }), out, { timeoutMs, timeoutAsError: opts.timeoutAsError })
   if (result.sessionRef) latestSessionByCwd.set(cwd, result.sessionRef)
   if (result.blocked) logger.warn({ agent: spec.id, reason: result.reason, exitCode: out.exitCode, auth: geminiShowsAuthFailure(summary, out.stderrTail) }, 'gemini-cli: run blocked/errored (text=null)')
-  await recordUsageBestEffort(spec.id, result, prompt, 'gemini-cli')
+  await recordUsageBestEffort(spec.id, result, prompt, 'gemini-cli', spec.provider)
   return result
 }
 

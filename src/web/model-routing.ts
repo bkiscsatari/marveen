@@ -39,6 +39,8 @@ import { inferProvider, runtimeSupportsProvider, defaultRuntimeFor, defaultAuthM
 import { lookupProviderSecret } from '../runtime/secret-ids.js'
 import { resolveFleetOauthToken } from '../runtime/claude-headless.js'
 import type { ProviderKind, RuntimeKind } from '../runtime/types.js'
+import { quotaCoolingDown } from '../runtime/quota-state.js'
+import { subscriptionRuntimeAvailability, type SubscriptionRuntimeAvailability } from './runtime-availability.js'
 import { evaluateRoutingGate, readRoutingCalibration, type GateVerdict } from './routing-gate.js'
 
 let cachedMode: { configured: RoutingMode; value: RoutingMode; gate: GateVerdict; readAt: number } | null = null
@@ -173,22 +175,37 @@ export interface RouteForRunInput extends ShadowRouteInput {
  * A target is available when its runtime is shipped and its provider can
  * authenticate on this host (vault key; the fleet OAuth token for Anthropic
  * subscriptions; nothing for Ollama). Quota windows (plan section 7) feed
- * in here later; today a target that IS configured is assumed to have budget.
+ * in via quota-state.ts (a recent 429 / usage-limit cools the runtime down).
  */
 export function targetAvailability(t: ProfileTarget, deps: {
   availableRuntimes: RuntimeKind[]
   secretLookup: (id: string) => string | null
   fleetOauthToken: string | null
   agentId: string
+  /** Seams for tests; production reads the live facts. */
+  quota?: (runtime: string, provider: string) => { cooling: boolean }
+  cliFacts?: () => Pick<SubscriptionRuntimeAvailability, 'minimax' | 'codex' | 'gemini'>
 } ): { available: boolean; runtime: RuntimeKind; provider: ProviderKind; reason?: string } {
   const provider = t.provider ?? inferProvider(t.model)
   const runtime = t.runtime ?? defaultRuntimeFor(provider, defaultAuthModeFor(provider), 'background')
   if (!deps.availableRuntimes.includes(runtime)) return { available: false, runtime, provider, reason: `runtime_unavailable:${runtime}` }
   if (!runtimeSupportsProvider(runtime, provider)) return { available: false, runtime, provider, reason: `runtime_provider_mismatch:${runtime}/${provider}` }
+  // A runtime that just answered 429 / usage limit is cooling down: pickTarget
+  // climbs to the next stronger available tier instead of walking into it.
+  const q = (deps.quota ?? quotaCoolingDown)(runtime, provider)
+  if (q.cooling) return { available: false, runtime, provider, reason: `quota_cooldown:${runtime}/${provider}` }
   if (provider === 'ollama') return { available: true, runtime, provider }
   if (provider === 'anthropic' && runtime.startsWith('claude-') && deps.fleetOauthToken) return { available: true, runtime, provider }
-  if (runtime === 'codex-cli' || runtime === 'gemini-cli') return { available: true, runtime, provider } // login checked by the adapter's healthProbe
+  // Subscription CLIs: installed AND logged in (runtime-availability.ts) -- the
+  // first version called codex/gemini "always available" and sent a
+  // subscription-only minimax target to the API-key check, which failed it.
+  const cli = runtime === 'codex-cli' ? 'codex' : runtime === 'gemini-cli' ? 'gemini' : runtime === 'minimax-cli' ? 'minimax' : null
   const key = lookupProviderSecret(provider, deps.agentId, deps.secretLookup)
+  if (cli) {
+    const facts = (deps.cliFacts ?? (() => subscriptionRuntimeAvailability()))()[cli]
+    if (facts.installed && (facts.loggedIn || key)) return { available: true, runtime, provider }
+    return { available: false, runtime, provider, reason: facts.installed ? `not_logged_in:${runtime}` : `not_installed:${runtime}` }
+  }
   return key ? { available: true, runtime, provider } : { available: false, runtime, provider, reason: `no_api_key:${provider}` }
 }
 

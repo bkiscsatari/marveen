@@ -18,10 +18,14 @@
 // Contract with the tmux world (agent-process.ts branches to here):
 //   - "running"  = an entry exists in `entries` (the operator started it, or
 //                  the reconciler restarted it after a dashboard restart).
-//   - "ready"    = state is idle (no turn in flight). A busy agent keeps the
-//                  message pending in the DB, exactly as a busy pane does, so
-//                  nothing is lost on a dashboard restart mid-turn.
-//   - "send"     = one queued turn: runtime.run(spec, text, { resume }).
+//   - "ready"    = nothing in flight AND nothing queued (headlessReady). A
+//                  busy agent keeps the message pending in the DB, exactly as a
+//                  busy pane does.
+//   - "send"     = one journalled turn: runtime.run(spec, text, { resume }).
+//                  'sent' means PERSISTED in store/headless-agents/<name>.queue.json
+//                  (see "durable turn journal" below): a crash or stop mid-turn
+//                  replays it at the next start, with an interruption note.
+//                  The queue is bounded (MAX_QUEUED_TURNS -> 'aborted-busy').
 //                  The agent answers the way every sub-agent does today --
 //                  through the dashboard API from inside its own tools -- so
 //                  the rest of the fleet cannot tell the difference.

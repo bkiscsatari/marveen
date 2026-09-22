@@ -280,7 +280,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { con
   const summary = acc.summary()
   const result = finalizeRunResult(minimaxSummaryToRunResult(summary, { runtime: 'minimax-cli', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode: out.exitCode, stderrTail: out.stderrTail }), out, { timeoutMs, timeoutAsError: opts.timeoutAsError })
   if (result.blocked) logger.warn({ agent: spec.id, reason: result.reason, exitCode: out.exitCode, auth: minimaxShowsAuthFailure(summary, out.stderrTail, out.exitCode) }, 'minimax-cli: run blocked/errored (text=null)')
-  await recordUsageBestEffort(spec.id, result, prompt, 'minimax-cli')
+  await recordUsageBestEffort(spec.id, result, prompt, 'minimax-cli', spec.provider)
   return result
 }
 

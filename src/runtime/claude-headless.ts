@@ -250,7 +250,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onR
   if (result.blocked) {
     logger.warn({ agent: spec.id, reason: result.reason, exitCode: out.exitCode }, 'claude-headless: run blocked/errored (text=null)')
   }
-  await recordUsageBestEffort(spec.id, result, prompt, 'claude-headless')
+  await recordUsageBestEffort(spec.id, result, prompt, 'claude-headless', spec.provider)
   return result
 }
 

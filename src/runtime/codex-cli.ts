@@ -223,7 +223,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
   const summary = acc.summary()
   const result = finalizeRunResult(codexSummaryToRunResult(summary, { runtime: 'codex-cli', provider: spec.provider, model: spec.model, timestamp: startedAt, exitCode: out.exitCode, stderrTail: out.stderrTail }), out, { timeoutMs, timeoutAsError: opts.timeoutAsError })
   if (result.blocked) logger.warn({ agent: spec.id, reason: result.reason, exitCode: out.exitCode, auth: codexShowsAuthFailure(summary) }, 'codex-cli: run blocked/errored (text=null)')
-  await recordUsageBestEffort(spec.id, result, prompt, 'codex-cli')
+  await recordUsageBestEffort(spec.id, result, prompt, 'codex-cli', spec.provider)
   return result
 }
 
