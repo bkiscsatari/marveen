@@ -3470,6 +3470,8 @@ function tmuxAttachCommand(agent) {
 // Append a single "copy tmux attach command" button to a running agent card.
 // Clicks copy to clipboard and never bubble to the card open-detail handler.
 function attachTmuxCopyButtons(card, agent) {
+  // A headless session agent has no tmux pane to attach to.
+  if (agent.headless) return
   const cmd = tmuxAttachCommand(agent)
   const row = document.createElement('div')
   row.className = 'agent-tmux-cmds'
