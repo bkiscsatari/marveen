@@ -70,6 +70,17 @@ export interface RuntimeCapabilities {
   contextWindow: number
 }
 
+/** MCP server definition (Claude Code .mcp.json shape; bundle-render's McpServerDef is structurally identical). */
+export interface McpServerSpec {
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  headers?: Record<string, string>
+  type?: string
+  [k: string]: unknown
+}
+
 export interface AgentSpec {
   /** Agent id (directory name under agents/, or MAIN_AGENT_ID). */
   id: string
@@ -84,6 +95,8 @@ export interface AgentSpec {
   securityProfile: string
   displayName?: string
   channelProvider?: string | null
+  /** MCP servers injected by Marveen itself (e.g. the Telegram bridge), merged over the agent's .mcp.json in every runtime. */
+  extraMcpServers?: Record<string, McpServerSpec>
 }
 
 export interface AgentHandle {

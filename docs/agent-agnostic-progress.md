@@ -89,3 +89,19 @@ Függőségek (verziók `npm view`-ból, 2026-09-22): `ai@7.0.109`, `@ai-sdk/ant
 - `src/runtime/native-api/index.ts` — az adapter: system prompt = CLAUDE.md+SOUL.md+skill-index, `generateText` + `stopWhen: stepCountIs(40)`, timeout AbortController-rel, usage → `token_usage`, `Stop`-hook eredménye a `reason`-ben (a Phase 5 bridge kezeli a reply-guard nudge-ot).
 
 Élő ellenőrzés kulcs nélkül: lokális **Ollama `qwen2.5:1.5b`** (letöltve) — `npx tsx scripts/smoke-native-api.ts`: healthProbe, Read-tool hívás strict engedélylistával + valós PreToolUse-hookkal, resume a `runtime_sessions`-ből, `token_usage` sorok. (Egy 1.5B-s modell tool-hívása nem mindig sikerül; a smoke ettől függetlenül a kapukat és a session-kezelést bizonyítja.)
+
+## Phase 5 — saját Telegram-bridge, fő-agent bármely runtime-on
+
+Új `src/channel/`:
+- `envelope.ts` — a `<channel source="plugin:telegram:marveen-bridge" chat_id message_id user ts …>` boríték, **bit-kompatibilis** a plugin formátumával (a `ledger-capture.py` CHANNEL_RX-e ellen tesztelve), forgott `</channel>` ellen védve.
+- `ledger.ts` — a `conversation_log` TS-ikre (logInbound/logOutbound/openQuestion/recent), azonos idempotencia.
+- `access.ts` — `store/channel-access.json` (dmPolicy allowlist|pairing|disabled, allowFrom, groups, pending), egyszeri migráció a plugin `~/.claude/channels/telegram/access.json`-jából; párosítási kód a csatornán, jóváhagyás CSAK owner-oldalon (`approvePending`).
+- `reply-guard.ts` — a `telegram-reply-guard.py` szabályai (ack-lexikon, stale, max nudge) külső őrként a Stop-hook nélküli runtime-okhoz.
+- `telegram-bridge.ts` — grammY 1.46 long polling; `handleInbound` injektált függőségekkel (tesztelhető), mellékletek letöltése `store/channel-bridge/inbox/`-ba, `image_path`/`attachment_*` attribútumok.
+- `mcp-server.ts` — `plugin_telegram_bridge` stdio MCP-szerver: `reply` (→ „sent (id: N)”, a `ledger-outbound.py` ezt parszolja), `send_file`, `edit_message`, `react`, `typing`, `download_attachment`; a tool-id `mcp__plugin_telegram_bridge__reply` illik a hookok `^mcp__plugin_[A-Za-z0-9_]+__reply$` matcherére; a ledger-be közvetlen sqlite-tal ír (INSERT OR IGNORE, nem duplikál a hookkal).
+- `service.ts` — `CHANNEL_BRIDGE=marveen|plugin` (default plugin); a fő-agent spec `runtime` mezője szerint fut (`claude-tmux` → bridge-módban `claude-headless`, mert a TUI a `channels.sh` területe); `extraMcpServers`-ként kapja a bridge MCP-t; typing-indikátor busy alatt; reply-guard nudge; halott handle respawn.
+- `src/channel-service.ts` — önálló ExecStart (`node dist/channel-service.js`) a `<service>-channels.service`-hez; `scripts/morning-briefing-runtime.ts` — a reggeli briefing bármely runtime-on (fallback: közvetlen küldés, ha az agent nem hívta a reply-t).
+
+Kereszt-vágás: `AgentSpec.extraMcpServers` — minden adapter beolvasztja (claude-headless: generált mcp-fájl `--mcp-config`-gal; codex: config.toml; gemini: settings.json; native-api: közvetlen kapcsolat; claude-tmux: `MARVEEN_EXTRA_MCP_CONFIG` env → `--mcp-config` flag a launcherben). `src/index.ts`: bridge indítás/leállítás a flag mögött.
+
+**Nem tesztelt élőben:** nincs dev Telegram-bot-token (az éles token nem használható, getUpdates-ütközés). A bridge logikája egységtesztelt (boríték-paritás, access, reply-guard, ledger, inbound-kezelés), az MCP-szerver valós stdio-folyamatként tesztelt (tool-lista + hibaút). Owner-teendő: dev-bot a @BotFather-nél, `TELEGRAM_BOT_TOKEN`+`ALLOWED_CHAT_ID` a dev `.env`-be, `CHANNEL_BRIDGE=marveen WEB_PORT=3421 npm run dev`, majd egy üzenet → válasz a headless fő-agenttől.

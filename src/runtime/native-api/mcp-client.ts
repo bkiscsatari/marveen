@@ -40,9 +40,10 @@ export async function connectMcpServer(name: string, def: McpServerDef, opts: { 
   return { name, client, close: () => client.close() }
 }
 
-/** Sanitize a server name the way Claude Code does for `mcp__<server>__<tool>` ids. */
+/** Sanitize a server name for `mcp__<server>__<tool>` ids: every non-alphanumeric
+ *  becomes `_` (Claude Code maps `plugin:telegram:telegram` to `plugin_telegram_telegram`). */
 export function mcpToolId(server: string, tool: string): string {
-  return `mcp__${server.replace(/[^A-Za-z0-9_-]/g, '_')}__${tool}`
+  return `mcp__${server.replace(/[^A-Za-z0-9_]/g, '_')}__${tool}`
 }
 
 export async function mcpToolSet(conns: McpConnection[], ctx: ToolContext): Promise<ToolSet> {

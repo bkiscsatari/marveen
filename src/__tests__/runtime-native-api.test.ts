@@ -108,7 +108,7 @@ describe('history + prompt helpers', () => {
     expect(sp.startsWith('<!--')).toBe(false)
   })
   it('mcpToolId follows the Claude Code spelling', () => {
-    expect(mcpToolId('marveen-channel', 'reply')).toBe('mcp__marveen-channel__reply')
+    expect(mcpToolId('marveen-channel', 'reply')).toBe('mcp__marveen_channel__reply')
     expect(mcpToolId('plugin:telegram', 'reply')).toBe('mcp__plugin_telegram__reply')
   })
 })

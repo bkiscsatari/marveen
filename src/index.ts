@@ -27,6 +27,7 @@ import { ensureDiscordChannelGroup } from './web/discord-group-bootstrap.js'
 import { startChannelRequestWatcher, stopChannelRequestWatcher } from './web/channel-request-watcher.js'
 import { startStoreWatcher, stopStoreWatcher } from './store-watcher.js'
 import { AGENTS_BASE_DIR } from './web/agent-config.js'
+import { channelBridgeMode, startChannelBridge, stopChannelBridge } from './channel/service.js'
 import {
   acquirePortLock,
   acquirePidfileLock,
@@ -415,6 +416,7 @@ const shutdown = (): void => {
     try { stopInviteMonitor() } catch (err) { logger.warn({ err }, 'stopInviteMonitor threw during shutdown') }
     try { stopChannelRequestWatcher() } catch (err) { logger.warn({ err }, 'stopChannelRequestWatcher threw during shutdown') }
     try { stopStoreWatcher() } catch (err) { logger.warn({ err }, 'stopStoreWatcher threw during shutdown') }
+    void stopChannelBridge().catch((err) => logger.warn({ err }, 'stopChannelBridge threw during shutdown'))
     if (decayInterval) clearInterval(decayInterval)
     if (digestTimer) clearTimeout(digestTimer)
     if (digestInterval) clearInterval(digestInterval)
@@ -581,6 +583,15 @@ async function main(): Promise<void> {
 
   // Web dashboard
   webServer = startWebServer(WEB_PORT)
+
+  // Agent-agnostic Phase 5: CHANNEL_BRIDGE=marveen runs the main agent on its
+  // configured runtime behind Marveen's own Telegram bridge (no Claude
+  // channels plugin). Default 'plugin' keeps channels.sh + the plugin.
+  if (channelBridgeMode() === 'marveen' && process.env.WEB_ONLY !== 'true') {
+    startChannelBridge()
+      .then((r) => logger.info({ detail: r.detail, ok: r.ok }, 'channel-bridge'))
+      .catch((err) => logger.error({ err }, 'channel-bridge failed to start'))
+  }
 
   logger.info(`Marveen fut! Dashboard: http://localhost:${WEB_PORT}`)
   logger.info('Telegram kommunikacio: Claude Code Channels kezeli')

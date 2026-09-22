@@ -100,7 +100,7 @@ export function prepareGeminiBundle(spec: AgentSpec, opts: { hooksEnabled?: bool
   if (!existsSync(geminiMdPath)) {
     writeFileSync(geminiMdPath, renderInstructionsMd({ displayName: spec.displayName, claudeMd: readText(join(dir, 'CLAUDE.md')), soulMd: readText(join(dir, 'SOUL.md')) }, { target: 'GEMINI.md' }))
   }
-  const mcp = readJson<{ mcpServers?: Record<string, McpServerDef> }>(join(dir, '.mcp.json'))?.mcpServers ?? {}
+  const mcp = { ...(readJson<{ mcpServers?: Record<string, McpServerDef> }>(join(dir, '.mcp.json'))?.mcpServers ?? {}), ...((spec.extraMcpServers ?? {}) as Record<string, McpServerDef>) }
   const settings = readJson<{ hooks?: ClaudeHooksConfig }>(join(dir, '.claude', 'settings.json'))
   const hooksEnabled = opts.hooksEnabled ?? true
   const shim = `${process.execPath} ${join(PROJECT_ROOT, 'scripts', 'hooks', 'shim', 'gemini-hook.mjs')}`

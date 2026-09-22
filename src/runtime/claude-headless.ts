@@ -206,8 +206,17 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions & { onR
   const { getSecret } = await import('../web/vault.js')
   const secretLookup = (id: string): string | null => { try { return getSecret(id) } catch { return null } }
   // The agent's own mcp.json when it has one; else the empty isolated one.
+  // Marveen-injected servers (spec.extraMcpServers, e.g. the Telegram bridge)
+  // are merged into a per-agent file under the headless home.
   const agentMcp = join(spec.dir, '.mcp.json')
-  const mcpConfigPath = spec.dir !== home && existsSync(agentMcp) ? agentMcp : mcpPath
+  let mcpConfigPath = spec.dir !== home && existsSync(agentMcp) ? agentMcp : mcpPath
+  if (spec.extraMcpServers && Object.keys(spec.extraMcpServers).length) {
+    let base: Record<string, unknown> = {}
+    try { base = (JSON.parse(readFileSync(mcpConfigPath, 'utf-8')) as { mcpServers?: Record<string, unknown> }).mcpServers ?? {} } catch { base = {} }
+    const merged = join(configDir, `mcp-${spec.id.replace(/[^A-Za-z0-9_-]/g, '_')}.json`)
+    writeFileSync(merged, JSON.stringify({ mcpServers: { ...base, ...spec.extraMcpServers } }, null, 2) + '\n', { mode: 0o600 })
+    mcpConfigPath = merged
+  }
   const cwd = opts.cwd ?? spec.dir
   const args = buildHeadlessArgs({
     model: spec.model,

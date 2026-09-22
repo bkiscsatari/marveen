@@ -146,7 +146,7 @@ export function prepareCodexBundle(spec: AgentSpec, opts: { permissionMode?: 'pe
   }
 
   // MCP servers: the agent's own .mcp.json (project-scoped), never the host's.
-  const mcp = readJson<{ mcpServers?: Record<string, McpServerDef> }>(join(dir, '.mcp.json'))?.mcpServers ?? {}
+  const mcp = { ...(readJson<{ mcpServers?: Record<string, McpServerDef> }>(join(dir, '.mcp.json'))?.mcpServers ?? {}), ...((spec.extraMcpServers ?? {}) as Record<string, McpServerDef>) }
 
   // Hooks
   const settings = readJson<{ hooks?: ClaudeHooksConfig }>(join(dir, '.claude', 'settings.json'))

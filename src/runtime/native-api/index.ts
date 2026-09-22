@@ -95,7 +95,7 @@ async function runOnce(spec: AgentSpec, prompt: string, opts: RunOptions = {}): 
   }
   const conns: McpConnection[] = []
   if (opts.allowTools !== false) {
-    const mcp = readJson<{ mcpServers?: Record<string, McpServerDef> }>(join(spec.dir, '.mcp.json'))?.mcpServers ?? {}
+    const mcp = { ...(readJson<{ mcpServers?: Record<string, McpServerDef> }>(join(spec.dir, '.mcp.json'))?.mcpServers ?? {}), ...((spec.extraMcpServers ?? {}) as Record<string, McpServerDef>) }
     for (const [name, def] of Object.entries(mcp)) {
       try { conns.push(await connectMcpServer(name, def, { cwd })) }
       catch (err) { logger.warn({ err, server: name, agent: spec.id }, 'native-api: MCP server connect failed (skipped)') }

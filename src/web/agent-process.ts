@@ -1330,6 +1330,11 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // the same reason). Every other agent (non-telegram, main, or flag off) keeps
     // the --channels launch path unchanged.
     const channelFlag = hasChannel && !useMcpJsonForChannel ? `--channels plugin:${provider.pluginId}` : ''
+    // Agent-agnostic Phase 5: an extra MCP config (e.g. the Marveen Telegram
+    // bridge server) can be attached to a TUI launch without touching the
+    // operator's .mcp.json. Path is single-quote escaped like the model id.
+    const extraMcp = (process.env.MARVEEN_EXTRA_MCP_CONFIG ?? '').trim()
+    const extraMcpFlag = extraMcp && /^[A-Za-z0-9_./~-]+$/.test(extraMcp) ? `--mcp-config ${shSingleQuote(extraMcp)} ` : ''
     // Channel-plugin MCP-registration guard (2026-06-23): the telegram/slack/etc.
     // channel plugin registers as a stdio MCP server loaded via --channels. Claude
     // Code connects stdio MCP servers in batches of MCP_SERVER_CONNECTION_BATCH_SIZE
@@ -1366,7 +1371,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // values like `claude-opus-4-8[1m]` (1M-context suffix) from being glob-expanded AND makes a `'`
     // in the value inert rather than a quote-break -> command injection. Same escape at the three
     // ANTHROPIC_MODEL env sites above.
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${providerEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${channelFlag}`.trimEnd()
+    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${providerEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${extraMcpFlag}${channelFlag}`.trimEnd()
     runTmux(null, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
 
     logger.info({ name, session, channelDir: agentChannelDir }, 'Agent tmux session started')
