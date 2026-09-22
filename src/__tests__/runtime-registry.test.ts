@@ -5,7 +5,6 @@ import {
   resetRuntimeRegistry,
   listRegisteredRuntimes,
   availableRuntimeKinds,
-  defaultRuntimeKind,
   RuntimeNotAvailableError,
 } from '../runtime/registry.js'
 import type { AgentRuntime } from '../runtime/types.js'
@@ -59,12 +58,5 @@ describe('runtime registry', () => {
   it('claude-headless loads lazily too', async () => {
     const rt = await getRuntime('claude-headless')
     expect(rt.kind).toBe('claude-headless')
-  })
-
-  it('defaultRuntimeKind honours a VALID env override only', () => {
-    expect(defaultRuntimeKind({})).toBe('claude-tmux')
-    expect(defaultRuntimeKind({ MARVEEN_DEFAULT_RUNTIME: 'claude-headless' })).toBe('claude-headless')
-    expect(defaultRuntimeKind({ MARVEEN_DEFAULT_RUNTIME: 'typo' })).toBe('claude-tmux')
-    expect(defaultRuntimeKind({ MARVEEN_DEFAULT_RUNTIME: ' ' })).toBe('claude-tmux')
   })
 })

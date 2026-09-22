@@ -169,12 +169,18 @@ export function resolveRuntimeSpec(
       warnings.push(`unknown_runtime:${String(cfg.runtime).slice(0, 40)}`)
     }
   }
-  if (!runtime && opts.envDefaultRuntime) {
-    if (isRuntimeKind(opts.envDefaultRuntime)) {
-      runtime = opts.envDefaultRuntime
-      runtimeSource = 'env'
+  const envRuntime = (opts.envDefaultRuntime ?? '').trim().toLowerCase()
+  if (!runtime && envRuntime) {
+    if (!isRuntimeKind(envRuntime)) {
+      warnings.push(`unknown_env_default_runtime:${envRuntime.slice(0, 40)}`)
+    } else if (!runtimeSupportsProvider(envRuntime, provider)) {
+      // A fleet-wide default must not move an agent onto a runtime that cannot
+      // serve its model (MARVEEN_DEFAULT_RUNTIME=codex-cli would otherwise put
+      // every Claude agent on Codex). Ignored for THIS agent, loudly.
+      warnings.push(`env_default_runtime_incompatible: ${envRuntime} cannot serve ${provider} models -- provider default used`)
     } else {
-      warnings.push(`unknown_env_default_runtime:${opts.envDefaultRuntime.slice(0, 40)}`)
+      runtime = envRuntime
+      runtimeSource = 'env'
     }
   }
   if (!runtime) {

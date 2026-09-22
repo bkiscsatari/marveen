@@ -6,7 +6,7 @@
 // needed the types -- and so an adapter that is not shipped yet fails with a
 // message that names the phase instead of a bare "undefined".
 
-import { isRuntimeKind, RUNTIME_KINDS, type AgentRuntime, type RuntimeKind } from './types.js'
+import { RUNTIME_KINDS, type AgentRuntime, type RuntimeKind } from './types.js'
 
 export class RuntimeNotAvailableError extends Error {
   constructor(public readonly kind: string, detail: string) {
@@ -78,12 +78,6 @@ export async function getRuntime(kind: RuntimeKind): Promise<AgentRuntime> {
   return rt
 }
 
-/**
- * Fleet-wide default runtime: MARVEEN_DEFAULT_RUNTIME when it names a known
- * kind, else claude-tmux (the pre-Phase-0 behaviour). An unknown value is
- * ignored, not honoured, so a typo cannot move the fleet.
- */
-export function defaultRuntimeKind(env: NodeJS.ProcessEnv = process.env): RuntimeKind {
-  const raw = env.MARVEEN_DEFAULT_RUNTIME?.trim()
-  return raw && isRuntimeKind(raw) ? raw : 'claude-tmux'
-}
+// The fleet-wide default (MARVEEN_DEFAULT_RUNTIME) is resolved per agent by
+// resolveRuntimeSpec(), which also checks runtime/provider compatibility; a
+// second, unchecked resolver here had no callers and was removed.

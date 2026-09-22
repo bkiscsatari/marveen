@@ -6,6 +6,7 @@ import { atomicWriteFileSync } from './atomic-write.js'
 import { safeJoin } from './sanitize.js'
 import { isValidModelId, InvalidModelIdError } from '../model-id.js'
 import { resolveRuntimeSpec, type RawRuntimeConfig, type ResolvedRuntimeSpec } from '../runtime/resolve-spec.js'
+import { envDefaultRuntime } from '../runtime/flags.js'
 import { isProviderKind, isRuntimeKind, type AgentRole } from '../runtime/types.js'
 import {
   resolveAgentModelFromConfig,
@@ -767,7 +768,7 @@ export function readAgentRuntimeConfig(name: string): RawRuntimeConfig {
 export function resolveAgentRuntimeSpec(name: string, role: AgentRole = name === MAIN_AGENT_ID ? 'main' : 'sub'): ResolvedRuntimeSpec {
   return resolveRuntimeSpec(readAgentModel(name), readAgentRuntimeConfig(name), {
     role,
-    envDefaultRuntime: process.env.MARVEEN_DEFAULT_RUNTIME,
+    envDefaultRuntime: envDefaultRuntime(),
   })
 }
 

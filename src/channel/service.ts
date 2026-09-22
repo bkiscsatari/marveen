@@ -15,6 +15,7 @@
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { logger } from '../logger.js'
+import { flagEnv } from '../runtime/env-flags.js'
 import { PROJECT_ROOT, STORE_DIR, MAIN_AGENT_ID, TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_ID } from '../config.js'
 import { getRuntime } from '../runtime/registry.js'
 import { buildAgentSpec } from '../runtime/agent-spec.js'
@@ -27,7 +28,7 @@ import type { McpServerDef } from '../runtime/bundle-render.js'
 
 export type ChannelBridgeMode = 'plugin' | 'marveen'
 
-export function channelBridgeMode(env: NodeJS.ProcessEnv = process.env): ChannelBridgeMode {
+export function channelBridgeMode(env: NodeJS.ProcessEnv = flagEnv()): ChannelBridgeMode {
   return (env.CHANNEL_BRIDGE || '').trim().toLowerCase() === 'marveen' ? 'marveen' : 'plugin'
 }
 

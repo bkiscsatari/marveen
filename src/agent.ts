@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import { PROJECT_ROOT } from './config.js'
-import { workerRuntimeKind } from './runtime/flags.js'
+import { workerRuntimeKind, agentBackend as flagAgentBackend } from './runtime/flags.js'
 
 const TYPING_REFRESH_MS = 4000
 import { logger } from './logger.js'
@@ -118,7 +118,7 @@ function resolveClaudeCodeBin(): string | undefined {
 // 'sdk' keeps the legacy Agent SDK `query` path (API billing) as an emergency
 // rollback via MARVEEN_AGENT_BACKEND=sdk.
 function agentBackend(): 'worker' | 'sdk' {
-  return (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() === 'sdk' ? 'sdk' : 'worker'
+  return flagAgentBackend()
 }
 
 export interface RunAgentOpts {
