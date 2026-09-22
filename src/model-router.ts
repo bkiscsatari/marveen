@@ -25,15 +25,17 @@
 
 import { MODEL_PROFILE_IDS, isModelProfileId, type ModelProfileId } from './model-profiles.js'
 
-export const ROUTING_MODES = ['off', 'shadow'] as const
+export const ROUTING_MODES = ['off', 'shadow', 'background'] as const
 export type RoutingMode = (typeof ROUTING_MODES)[number]
 
-/** Unknown or empty -> 'off'. Reserved future modes ('background', 'all')
- *  also resolve to 'shadow' so a config written ahead of B1 cannot switch
- *  anything live by accident. */
+/** Unknown or empty -> 'off'. 'background' = B1: apply the suggestion to
+ *  background tasks (fresh runtime process, no respawn). 'all' is reserved for
+ *  the inter-agent/kanban respawn path and behaves as 'background' until that
+ *  is wired, so a config written ahead of it cannot switch a live pane. */
 export function normalizeRoutingMode(raw: unknown): RoutingMode {
   const v = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
-  if (v === 'shadow' || v === 'background' || v === 'all') return 'shadow'
+  if (v === 'shadow') return 'shadow'
+  if (v === 'background' || v === 'all') return 'background'
   return 'off'
 }
 
@@ -223,4 +225,36 @@ export function shouldSwitch(current: ModelProfileId, suggested: ModelProfileId,
   const diff = profileRank(current) - profileRank(suggested) // >0 = suggested is stronger
   if (diff > 0) return true
   return diff <= -2
+}
+
+// --- B1: choose the (runtime, provider, model) target for a decision ------------
+//
+// Pure. `targets` is the deployment map resolved per profile (null when the
+// map is missing/unusable for that profile); `isAvailable` says whether a
+// target can run on this host right now (runtime shipped, key/login present,
+// budget). An unavailable suggestion climbs to the next STRONGER tier -- never
+// a weaker one, for the same asymmetry reason as RISKY_FLOOR.
+
+import type { ProfileTarget } from './model-profiles.js'
+
+export type TargetPick =
+  | { kind: 'apply'; profile: ModelProfileId; target: ProfileTarget }
+  | { kind: 'skip'; reason: string }
+
+export function pickTarget(
+  decision: RoutingDecision,
+  targets: Record<string, ProfileTarget | null>,
+  isAvailable: (t: ProfileTarget) => boolean,
+): TargetPick {
+  if (decision.needsReview || !decision.profile) return { kind: 'skip', reason: 'needs_review' }
+  if (!decision.actionable) return { kind: 'skip', reason: 'not_actionable' }
+  const wanted = targets[decision.profile]
+  if (!wanted) return { kind: 'skip', reason: `profile_map_missing:${decision.profile}` }
+  // Walk from the suggested tier upward (stronger) until one is available.
+  for (let rank = profileRank(decision.profile); rank >= 0; rank--) {
+    const p = MODEL_PROFILE_IDS[rank]
+    const t = targets[p]
+    if (t && isAvailable(t)) return { kind: 'apply', profile: p, target: t }
+  }
+  return { kind: 'skip', reason: `target_unavailable:${decision.profile}` }
 }

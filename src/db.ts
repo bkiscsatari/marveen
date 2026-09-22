@@ -706,6 +706,11 @@ export function initDatabase(dbPathOverride?: string): void {
     )
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_model_routing_agent_ts ON model_routing_log(agent, ts)`)
+  // Agent-agnostic Phase 4b (B1): what the router actually applied to a
+  // background run, and why it did not when it did not.
+  for (const col of ['applied INTEGER', 'applied_runtime TEXT', 'applied_model TEXT', 'fallback_reason TEXT']) {
+    try { db.exec(`ALTER TABLE model_routing_log ADD COLUMN ${col}`) } catch { /* already exists */ }
+  }
 
   // --- Token Usage Monitoring ---
   db.exec(`

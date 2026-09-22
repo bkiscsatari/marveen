@@ -20,13 +20,14 @@ import {
 import { MODEL_PROFILE_IDS } from '../model-profiles.js'
 
 describe('normalizeRoutingMode', () => {
-  it('is off unless explicitly shadow; reserved B1 modes degrade to shadow', () => {
+  it('is off unless explicitly set; background/all are the B1 apply mode', () => {
     expect(normalizeRoutingMode(undefined)).toBe('off')
     expect(normalizeRoutingMode('')).toBe('off')
-    expect(normalizeRoutingMode('on')).toBe('off')
+    expect(normalizeRoutingMode('nonsense')).toBe('off')
+    expect(normalizeRoutingMode('shadow')).toBe('shadow')
     expect(normalizeRoutingMode(' Shadow ')).toBe('shadow')
-    expect(normalizeRoutingMode('background')).toBe('shadow')
-    expect(normalizeRoutingMode('all')).toBe('shadow')
+    expect(normalizeRoutingMode('background')).toBe('background')
+    expect(normalizeRoutingMode('all')).toBe('background')
   })
 })
 

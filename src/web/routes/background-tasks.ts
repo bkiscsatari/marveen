@@ -9,7 +9,7 @@ import { resolveFromPath } from '../../platform.js'
 import { APP_TZ } from '../../config.js'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
-import { shadowRoute } from '../model-routing.js'
+import { shadowRoute, routeForRun } from '../model-routing.js'
 import type { RouteContext } from './types.js'
 import { bgRuntimeKind } from '../../runtime/flags.js'
 import { getRuntime } from '../../runtime/registry.js'
@@ -86,8 +86,12 @@ function spawnViaRuntime(id: string, agentId: string, prompt: string, kind: Runt
   runtimeLive.set(id, live)
   void (async () => {
     try {
-      const rt = await getRuntime(kind)
-      const spec = buildAgentSpec(agentId, 'background')
+      let spec = buildAgentSpec(agentId, 'background')
+      // Jev B1 (MODEL_ROUTING=background): a fresh process, so the suggestion
+      // can become THIS run's (runtime, provider, model) without a respawn.
+      const override = await routeForRun({ source: 'background', agent: agentId, text: prompt, taskRef: id, current: { runtime: spec.runtime, provider: spec.provider, model: spec.model } })
+      if (override) spec = { ...spec, runtime: override.runtime, provider: override.provider, model: override.model }
+      const rt = await getRuntime(override ? override.runtime : kind)
       const r = await rt.run(spec, prompt, {
         allowTools: true,
         timeoutMs: TIMEOUT_MS,
@@ -105,7 +109,6 @@ function spawnViaRuntime(id: string, agentId: string, prompt: string, kind: Runt
     }
   })()
   logger.info({ id, agentId, kind, prompt: prompt.slice(0, 100) }, 'Background task started via runtime')
-  shadowRoute({ source: 'background', agent: agentId, text: prompt, taskRef: id })
   return task
 }
 
