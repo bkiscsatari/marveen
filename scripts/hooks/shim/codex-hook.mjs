@@ -13,8 +13,8 @@
 // A missing/undecodable argument BLOCKS (exit 2): a gate that cannot run must
 // fail closed, mirroring the governance-kapu convention in settings.json.
 
-import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { normalizeToolInput, runClaudeHook } from './shim-common.mjs'
 
 const CODEX_TO_CLAUDE_TOOL = {
   shell: 'Bash', exec_command: 'Bash', local_shell: 'Bash', Bash: 'Bash', bash: 'Bash',
@@ -43,21 +43,13 @@ function main() {
   try { payload = raw.trim() ? JSON.parse(raw) : {} } catch { payload = { _raw: raw } }
   if (payload && typeof payload === 'object') {
     if ('tool_name' in payload) payload.tool_name = mapToolName(payload.tool_name)
+    if ('tool_input' in payload) payload.tool_input = normalizeToolInput(payload.tool_name, payload.tool_input)
     payload._marveen_runtime = 'codex-cli'
   }
-  const res = spawnSync('/bin/sh', ['-c', command], {
-    input: JSON.stringify(payload),
-    encoding: 'utf-8',
-    env: { ...process.env, MARVEEN_HOOK_RUNTIME: 'codex-cli' },
-    maxBuffer: 8 * 1024 * 1024,
-  })
+  const res = runClaudeHook(command, payload, { ...process.env, MARVEEN_HOOK_RUNTIME: 'codex-cli' })
   if (res.stdout) process.stdout.write(res.stdout)
   if (res.stderr) process.stderr.write(res.stderr)
-  if (res.error) {
-    process.stderr.write(`codex-hook shim: failed to run hook: ${res.error.message}\n`)
-    process.exit(2)
-  }
-  process.exit(res.status ?? 2)
+  process.exit(res.status)
 }
 
 main()
