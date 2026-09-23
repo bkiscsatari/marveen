@@ -238,6 +238,6 @@ Jev-repó (`C:\Users\bkisc\Projects\Jev`, **külön branch** `feat/marveen-calib
 7. Visszaállás: `git -C ~/marveen reset --hard pre-hardening && cd ~/marveen && npm run build && systemctl --user restart icuka-dashboard` (Scout új pluginja ekkor maradhat; a régi név a régi kóddal újra létrejön).
 
 ### Owner-teendők (változatlanul / újak)
-- Upstream PR a `Szotasz/marveen`-re az egress-javítással? (publikus művelet — döntés kell)
+- Upstream PR: nem kell — a `Szotasz/marveen` nem a mi repónk (owner, 2026-09-23); a javítás a saját forkban él.
 - Jev: a kalibrációs fájl írása (`--write-calibration`) és jóváhagyás (`--approve`) csak ≥100 címkézett sor után; a Jev-repó branch merge-e.
 - Codex/Gemini login (utána a paritás-mátrix élő ellenőrzése és fixture-rögzítés), dev Telegram-bot a bridge élő próbájához — mint eddig.
