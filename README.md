@@ -13,6 +13,8 @@
 
 > AI csapatod, ami fut amíg te alszol.
 
+> **Ez a `bkiscsatari/marveen` fork.** Miben tér el a `Szotasz/marveen`-től (agent-agnosztikus runtime réteg, saját Telegram-bridge, Jev model routing, hardening), hogyan épül fel és hogyan követi az upstreamet: [docs/FORK.md](docs/FORK.md).
+
 Marveen egy AI asszisztens keretrendszer, ami Claude Code-ra épül. Az agent-agnosztikus runtime réteggel (lásd `docs/runtime.md`) az ügynökök Codex CLI-n, Gemini CLI-n, MiniMax Code-on vagy bármely API-kulcsos modellen (DeepSeek, MiniMax, OpenRouter, Ollama, …) is futnak, a Claude Code marad az első osztályú alapértelmezés. Saját AI csapatot építhetsz, akik Telegramon, Slacken vagy Discordon kommunikálnak veled, önállóan dolgoznak, és egymással is együttműködnek.
 
 Marveen is a self-hostable **agent harness** for Claude Code: it runs a team of AI agents, each with its own chat channel (Telegram, Slack or Discord), persistent memory, scheduled tasks, and MCP tools, lets them delegate work to one another, and gives you a web dashboard to watch and steer them. With the agent-agnostic runtime layer (`docs/runtime.md`) agents can also run on Codex CLI, Gemini CLI, MiniMax Code or any API-key model; Claude Code stays the first-class default.
